@@ -18,11 +18,14 @@ Agent flow for "Why is churn increasing?":
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from onlymetrix.client import OnlyMetrix
+
+logger = logging.getLogger(__name__)
 
 
 class Analysis:
@@ -87,7 +90,7 @@ class Analysis:
                     author=dag.get("author"),
                 )
             except Exception:
-                pass  # Server save failed — local registration still works
+                logger.warning("Failed to save DAG '%s' to server; local registration still works", dag.get("name"))
 
     def export_dag(self, name: str, save_to_server: bool = False, **params) -> dict:
         """Export a registered Python function as a JSON DAG.
@@ -115,6 +118,7 @@ class Analysis:
                 if "source" not in c:
                     c["source"] = "local"
         except Exception:
+            logger.debug("Could not fetch server-side custom analyses; showing local only")
             for c in local:
                 c["source"] = "local"
         return local
@@ -163,6 +167,278 @@ class Analysis:
         """Check metric health: freshness, null rates, stability."""
         from onlymetrix.analysis_v2 import health
         return health(self._om, metric)
+
+    def causal_impact(
+        self,
+        metric: str,
+        event_date: str,
+        event: Optional[str] = None,
+        **kwargs: Any,
+    ) -> dict:
+        """Estimate causal impact of an event on a metric.
+
+        Uses synthetic control from pre-event trend to construct a
+        counterfactual. The difference between actual and synthetic
+        is the estimated impact.
+
+        Args:
+            metric: Metric to analyze.
+            event_date: ISO date of the event (e.g., "2026-02-01").
+            event: Human-readable event name (e.g., "campaign_launch").
+            **kwargs: Optional filters.
+
+        Returns:
+            Dict with total_effect, effect_pct, comparison timeline,
+            confidence score, and model diagnostics.
+        """
+        body = {"metric": metric, "event_date": event_date}
+        if event:
+            body["event"] = event
+        if "filters" in kwargs:
+            body["filters"] = kwargs["filters"]
+        return self._om._request("POST", "/v1/analysis/causal-impact", json=body)
+
+    def scenario(
+        self,
+        metric: str,
+        changes: dict[str, float],
+        months: int = 6,
+        **kwargs: Any,
+    ) -> dict:
+        """Model impact of hypothetical changes on a metric.
+
+        Projects the metric forward under specified changes, comparing
+        the scenario projection against the baseline trend.
+
+        Args:
+            metric: Metric to model.
+            changes: Dict of variable -> fractional delta.
+                     E.g., {"churn_rate": 0.05, "new_customers": -0.10}
+                     means churn +5%, new customers -10%.
+            months: How many months to project forward.
+            **kwargs: Optional filters.
+
+        Returns:
+            Dict with baseline_projection, scenario_projection,
+            delta, break_even analysis, and model diagnostics.
+        """
+        body: dict[str, Any] = {"metric": metric, "changes": changes, "months": months}
+        if "filters" in kwargs:
+            body["filters"] = kwargs["filters"]
+        return self._om._request("POST", "/v1/analysis/scenario", json=body)
+
+    def benchmark(
+        self,
+        metric: str,
+        against: str = "historical",
+        dimension: Optional[str] = None,
+        **kwargs: Any,
+    ) -> dict:
+        """Compare a metric against benchmarks.
+
+        Benchmark types:
+            - "historical": Compare current value against the metric's
+              own historical distribution (percentiles).
+            - "peer_cohort": Compare segments within a dimension against
+              each other (requires dimension parameter).
+            - "industry_percentile": Compare against industry benchmarks
+              (enterprise feature, requires configuration).
+
+        Args:
+            metric: Metric to benchmark.
+            against: Benchmark type ("historical", "peer_cohort", "industry_percentile").
+            dimension: Required for peer_cohort — which dimension to segment by.
+            **kwargs: Optional filters.
+
+        Returns:
+            Dict with current value, percentile, distribution stats,
+            and performance classification.
+        """
+        body: dict[str, Any] = {"metric": metric, "against": against}
+        if dimension:
+            body["dimension"] = dimension
+        if "filters" in kwargs:
+            body["filters"] = kwargs["filters"]
+        return self._om._request("POST", "/v1/analysis/benchmark", json=body)
+
+    def metric_impact(
+        self,
+        source_metric: str,
+        target_metric: str,
+        change_pct: float = 10.0,
+        horizon_days: Optional[int] = None,
+    ) -> dict:
+        """Estimate the causal impact of one metric on another.
+
+        Uses the IR dependency graph + historical correlation to estimate
+        how a change in the source metric propagates to the target.
+
+        Args:
+            source_metric: The metric that changes (e.g., "churn_risk").
+            target_metric: The metric to predict impact on (e.g., "mrr").
+            change_pct: Hypothetical % change in source (e.g., 10.0 = +10%).
+            horizon_days: Time horizon for impact (default: 90 days).
+
+        Returns:
+            Dict with estimated_target_change_pct, relationship type,
+            correlation, impact_coefficient, and confidence.
+        """
+        body: dict[str, Any] = {
+            "source_metric": source_metric,
+            "target_metric": target_metric,
+            "change_pct": change_pct,
+        }
+        if horizon_days is not None:
+            body["horizon_days"] = horizon_days
+        return self._om._request("POST", "/v1/analysis/metric-impact", json=body)
+
+    def counterfactual(
+        self,
+        metric: str,
+        remove_segment: dict[str, str],
+        dimension: Optional[str] = None,
+    ) -> dict:
+        """Counterfactual — "what would the metric be without this segment?"
+
+        Queries the metric with and without the segment, then computes
+        the contribution of the removed segment.
+
+        Args:
+            metric: Metric to analyze.
+            remove_segment: Dict of column=value to remove.
+                           E.g., {"tier": "free"} removes free-tier.
+            dimension: Optional dimension for per-segment breakdown.
+
+        Returns:
+            Dict with baseline, segment_contribution, counterfactual
+            value, change_pct, and optional dimensional breakdown.
+        """
+        body: dict[str, Any] = {
+            "metric": metric,
+            "remove_segment": remove_segment,
+        }
+        if dimension:
+            body["dimension"] = dimension
+        return self._om._request("POST", "/v1/analysis/counterfactual", json=body)
+
+    def monitor(
+        self,
+        metric: str,
+        condition: str,
+        threshold: float,
+        window: Optional[str] = None,
+        **kwargs: Any,
+    ) -> dict:
+        """Evaluate a metric against a monitoring rule.
+
+        Checks the metric's current value against a threshold condition
+        over a rolling window. Returns whether the alert is triggered.
+
+        Args:
+            metric: Metric to monitor.
+            condition: One of "drops_below", "rises_above", "changes_by",
+                      "outside_range".
+            threshold: The threshold value. For "changes_by", this is max
+                      allowed % change. For "outside_range", this is z-score.
+            window: Time window expression (e.g., "last_7d", "last_30d").
+            **kwargs: Optional filters.
+
+        Returns:
+            Dict with triggered (bool), severity, current value,
+            trend context, and suggested actions.
+        """
+        body: dict[str, Any] = {
+            "metric": metric, "condition": condition, "threshold": threshold,
+        }
+        if window:
+            body["window"] = window
+        if "filters" in kwargs:
+            body["filters"] = kwargs["filters"]
+        return self._om._request("POST", "/v1/analysis/monitor", json=body)
+
+    def data_quality(
+        self,
+        metric: str,
+        checks: Optional[list[str]] = None,
+    ) -> dict:
+        """Compute a data quality score for a metric's source data.
+
+        Runs checks against the metric's source tables and produces
+        a 0-100 score with per-check breakdown.
+
+        Args:
+            metric: Metric to assess.
+            checks: List of checks to run. Default: all.
+                   Options: "nulls", "duplicates", "freshness",
+                           "schema_drift", "volume".
+
+        Returns:
+            Dict with overall score (0-100), grade (A-F),
+            per-check details, and issues found.
+        """
+        body: dict[str, Any] = {"metric": metric}
+        if checks:
+            body["checks"] = checks
+        return self._om._request("POST", "/v1/analysis/data-quality", json=body)
+
+    def cohort(
+        self,
+        metric: str,
+        entity: str = "customer_id",
+        cohort_dim: str = "signup_month",
+        periods: int = 12,
+        **kwargs: Any,
+    ) -> dict:
+        """Cohort retention analysis.
+
+        Groups entities by cohort dimension (e.g., signup month) and
+        tracks retention across subsequent periods. Uses Kanoniv entity
+        resolution for clean cross-table tracking.
+
+        Args:
+            metric: Metric to analyze (must return entity-level rows).
+            entity: Entity ID column (e.g., "customer_id").
+            cohort_dim: Dimension to group cohorts by (e.g., "signup_month").
+            periods: Number of periods to track (max 24).
+            **kwargs: Optional filters.
+
+        Returns:
+            Dict with retention_curve, half_life, avg_churn_per_period,
+            steepest_drop_period, and insights.
+        """
+        body: dict[str, Any] = {
+            "metric": metric, "entity": entity,
+            "cohort_dim": cohort_dim, "periods": periods,
+        }
+        if "filters" in kwargs:
+            body["filters"] = kwargs["filters"]
+        return self._om._request("POST", "/v1/analysis/cohort", json=body)
+
+    def funnel(
+        self,
+        steps: list[dict],
+        entity: str = "customer_id",
+    ) -> dict:
+        """Funnel analysis — step-by-step conversion with drop-off.
+
+        Takes a sequence of steps (each with a metric and optional
+        filters) and computes conversion between each step using
+        entity-resolved IDs.
+
+        Args:
+            steps: List of dicts with "name", "metric", and optional "filters".
+                   E.g., [{"name": "Signup", "metric": "signups"},
+                          {"name": "Activation", "metric": "activations"},
+                          {"name": "Purchase", "metric": "purchases"}]
+            entity: Entity ID column for tracking across steps.
+
+        Returns:
+            Dict with per-step conversion rates, drop rates,
+            biggest_drop identification, and overall conversion.
+        """
+        return self._om._request("POST", "/v1/analysis/funnel", json={
+            "steps": steps, "entity": entity,
+        })
 
     # ── Core (existing) ──────────────────────────────────────────
 
@@ -487,13 +763,9 @@ class Analysis:
                     "generated_at": _now(), "insights": ["Metric does not support time filters and has no time column"],
                     "breakdown": [], "total_change_absolute": 0, "direction": "unknown",
                 }
-            # Split rows by time period. Normalize time values to handle
-            # various formats: "2011-07-01", "2011-07-01T00:00:00+00:00",
-            # "2011-07-01 00:00:00", etc.
-            def _matches_period(row_val: Any, period: str) -> bool:
-                s = str(row_val).replace("T", " ").split(" ")[0]  # extract date part
-                return s.startswith(period)
-
+            # Split rows by time period using proper date parsing.
+            # Handles: "2011-07-01", "2011-07-01T00:00:00+00:00",
+            # "2011-07-01 00:00:00", timestamps with timezone offsets, etc.
             prev_rows = [r for r in all_data.rows if _matches_period(r.get(time_col, ""), previous)]
             curr_rows = [r for r in all_data.rows if _matches_period(r.get(time_col, ""), current)]
 
@@ -951,6 +1223,60 @@ def _guess_measure(result: Any, exclude: Optional[str] = None) -> Optional[str]:
         if col["name"] != exclude:
             return col["name"]
     return None
+
+
+def _parse_date_str(val: Any) -> Optional[str]:
+    """Parse a date/timestamp value to an ISO date string (YYYY-MM-DD).
+
+    Handles: date strings, ISO timestamps with/without timezone offsets,
+    space-separated timestamps, and Python date/datetime objects.
+    Returns None if parsing fails.
+    """
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+
+    # Try Python's datetime.fromisoformat (handles most ISO formats)
+    # Python 3.11+ handles "Z" suffix; earlier versions need fixup
+    try:
+        from datetime import datetime as _dt, date as _d
+        if isinstance(val, _d):
+            return val.isoformat()
+        normalized = s.replace("Z", "+00:00")
+        # fromisoformat doesn't handle space-separated format in <3.11
+        # but does handle "T"-separated. Normalize space to T.
+        if "T" not in normalized and " " in normalized:
+            parts = normalized.split(" ", 1)
+            if len(parts[0]) == 10:  # looks like YYYY-MM-DD
+                normalized = parts[0] + "T" + parts[1]
+        dt = _dt.fromisoformat(normalized)
+        return dt.date().isoformat()
+    except (ValueError, TypeError):
+        pass
+
+    # Fallback: extract date portion via regex, validate month/day
+    import re
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return m.group(0)
+
+    return None
+
+
+def _matches_period(row_val: Any, period: str) -> bool:
+    """Check if a timestamp value falls within a period prefix.
+
+    Uses proper date parsing to handle timezone offsets correctly.
+    Period can be "2011", "2011-07", "2011-07-01", etc.
+    """
+    date_str = _parse_date_str(row_val)
+    if date_str is None:
+        return False
+    return date_str.startswith(period)
 
 
 def _find_time_column(result: Any) -> Optional[str]:

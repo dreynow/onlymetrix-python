@@ -1,5 +1,7 @@
 """Tests for OnlyMetrix data models."""
 
+import pytest
+
 from onlymetrix.models import (
     Metric,
     MetricResult,
@@ -152,3 +154,31 @@ class TestMetricRequest:
         assert mr.request_count == 3
         assert mr.status == "pending"
         assert mr.fulfilled_by is None
+
+
+class TestFromDictErrors:
+    """Verify from_dict gives clear errors for missing required fields."""
+
+    def test_metric_missing_name(self):
+        with pytest.raises(ValueError, match="Metric.from_dict: missing required field 'name'"):
+            Metric.from_dict({"description": "test"})
+
+    def test_metric_missing_description(self):
+        with pytest.raises(ValueError, match="Metric.from_dict: missing required field 'description'"):
+            Metric.from_dict({"name": "test"})
+
+    def test_query_result_missing_columns(self):
+        with pytest.raises(ValueError, match="QueryResult.from_dict: missing required field 'columns'"):
+            QueryResult.from_dict({"rows": [], "row_count": 0, "execution_time_ms": 0, "executed_sql": ""})
+
+    def test_table_missing_schema(self):
+        with pytest.raises(ValueError, match="Table.from_dict: missing required field 'schema'"):
+            Table.from_dict({"table": "orders"})
+
+    def test_column_missing_type(self):
+        with pytest.raises(ValueError, match="Column.from_dict: missing required field 'type'"):
+            Column.from_dict({"name": "id"})
+
+    def test_metric_request_missing_id(self):
+        with pytest.raises(ValueError, match="MetricRequest.from_dict: missing required field 'id'"):
+            MetricRequest.from_dict({"description": "x", "request_count": 1, "status": "pending"})

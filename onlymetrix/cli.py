@@ -13,9 +13,9 @@ import click
 from onlymetrix.client import OnlyMetrix, OnlyMetrixError
 
 
-def _get_client() -> OnlyMetrix:
-    url = os.environ.get("OMX_API_URL", "http://localhost:8080")
-    api_key = os.environ.get("OMX_API_KEY")
+def _get_client(url: str | None = None, api_key: str | None = None) -> OnlyMetrix:
+    url = url or os.environ.get("OMX_API_URL", "http://localhost:8080")
+    api_key = api_key or os.environ.get("OMX_API_KEY")
     return OnlyMetrix(url=url, api_key=api_key)
 
 
@@ -94,6 +94,10 @@ def metrics_list(ctx: click.Context, search: str | None, tag: str | None) -> Non
 @click.option("--filter", "filters", multiple=True, help="Filters as key=value pairs")
 @click.option("--dimension", default=None, help="Dimension to group by")
 @click.option("--limit", default=None, type=int, help="Row limit")
+@click.option(
+    "--period", default=None,
+    help="Semantic period: mtd, ytd, wtd, wow, mom, yoy, last_7d, last_30d, range:start,end",
+)
 @click.pass_context
 def metrics_query(
     ctx: click.Context,
@@ -101,6 +105,7 @@ def metrics_query(
     filters: tuple[str, ...],
     dimension: str | None,
     limit: int | None,
+    period: str | None,
 ) -> None:
     """Query a metric by name."""
     try:
@@ -119,7 +124,8 @@ def metrics_query(
 
         with _get_client() as om:
             result = om.metrics.query(
-                name, filters=parsed_filters, dimension=dimension, limit=limit
+                name, filters=parsed_filters, dimension=dimension, limit=limit,
+                period=period,
             )
             _output(result, ctx.obj["pretty"])
     except OnlyMetrixError as e:
@@ -353,6 +359,66 @@ def compiler_status(ctx: click.Context) -> None:
         _handle_error(e)
 
 
+@compiler.command("inspect")
+@click.argument("metric_name")
+@click.pass_context
+def compiler_inspect(ctx: click.Context, metric_name: str) -> None:
+    """Show full compiled IR for a specific metric."""
+    try:
+        with _get_client() as om:
+            result = om.compiler.inspect(metric_name)
+            if result is None:
+                click.echo(json.dumps({"error": f"Metric '{metric_name}' not found in compiled IR"}), err=True)
+                sys.exit(1)
+            _output(result, ctx.obj["pretty"])
+    except OnlyMetrixError as e:
+        _handle_error(e)
+
+
+@compiler.command("validate")
+@click.pass_context
+def compiler_validate(ctx: click.Context) -> None:
+    """Validate all compiled metrics — check for fan-out risk, missing joins, PII exposure."""
+    try:
+        with _get_client() as om:
+            data = om.compiler.status()
+            metrics = data.get("metrics", [])
+            issues: list[dict] = []
+            for m in metrics:
+                name = m.get("name", "")
+                for j in m.get("joins", []):
+                    if j.get("fanout_risk"):
+                        issues.append({"metric": name, "type": "fanout_risk", "detail": f"Join {j['from']} → {j['to']} may cause row multiplication"})
+                    if not j.get("cardinality"):
+                        issues.append({"metric": name, "type": "unknown_cardinality", "detail": f"Join {j['from']} → {j['to']} has no cardinality info"})
+                if not m.get("measures"):
+                    issues.append({"metric": name, "type": "no_measures", "detail": "No measures detected — metric may be opaque"})
+            summary = {
+                "total_metrics": len(metrics),
+                "structured": sum(1 for m in metrics if m.get("kind") == "structured"),
+                "opaque": sum(1 for m in metrics if m.get("kind") != "structured"),
+                "issues": len(issues),
+                "details": issues,
+            }
+            _output(summary, ctx.obj["pretty"])
+    except OnlyMetrixError as e:
+        _handle_error(e)
+
+
+@compiler.command("agent-context")
+@click.option("--query", "-q", default=None, help="Query to rank metrics by relevance")
+@click.option("--top-k", "-k", default=10, help="Max metrics to include (default 10)")
+@click.pass_context
+def compiler_agent_context(ctx: click.Context, query: str | None, top_k: int) -> None:
+    """Emit prompt-ready IR for LLM agent injection."""
+    try:
+        with _get_client() as om:
+            context = om.compiler.agent_context(query=query, top_k=top_k)
+            click.echo(context)
+    except OnlyMetrixError as e:
+        _handle_error(e)
+
+
 @compiler.command("import")
 @click.option("--format", "fmt", required=True, help="Import format (dbt, lookml)")
 @click.argument("file", type=click.Path(exists=True))
@@ -374,6 +440,98 @@ def compiler_import(ctx: click.Context, fmt: str, file: str, apply_flag: bool) -
         with _get_client() as om:
             result = om.compiler.import_format(format=fmt, content=parsed, apply=apply_flag)
             _output(result, ctx.obj["pretty"])
+    except OnlyMetrixError as e:
+        _handle_error(e)
+
+
+# ── Export ────────────────────────────────────────────────────────────
+
+
+@cli.command("export")
+@click.option(
+    "--format", "fmt",
+    required=True,
+    type=click.Choice(["metricflow"]),
+    help="Output format.",
+)
+@click.option(
+    "--output", "output_path",
+    default=None,
+    help="Output file path. Default: models/marts/om_generated_metrics.yml",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Preview output without writing to disk.",
+)
+@click.option(
+    "--all-sources",
+    is_flag=True,
+    default=False,
+    help="Include metrics from all sources (config, dashboard, dbt). Default: dbt-sourced only.",
+)
+@click.pass_context
+def export_cmd(ctx: click.Context, fmt: str, output_path: str | None, dry_run: bool, all_sources: bool) -> None:
+    """Export compiled IR to an external metric format.
+
+    \b
+    Examples:
+      omx export --format metricflow
+      omx export --format metricflow --output path/to/metrics.yml
+      omx export --format metricflow --dry-run
+      omx export --format metricflow --all-sources
+    """
+    from onlymetrix.export import run_export
+    try:
+        with _get_client() as om:
+            exit_code = run_export(fmt=fmt, output_path=output_path, dry_run=dry_run, client=om, all_sources=all_sources)
+            sys.exit(exit_code)
+    except OnlyMetrixError as e:
+        _handle_error(e)
+
+
+@cli.command("validate")
+@click.option(
+    "--format", "fmt",
+    required=True,
+    type=click.Choice(["metricflow"]),
+    help="Format to validate against.",
+)
+@click.option(
+    "--strict",
+    is_flag=True,
+    default=False,
+    help="Treat warnings as errors (for CI gates).",
+)
+@click.option(
+    "--output", "output_fmt",
+    default="text",
+    type=click.Choice(["text", "json"]),
+    help="Output format. Default: text",
+)
+@click.pass_context
+def validate_cmd(ctx: click.Context, fmt: str, strict: bool, output_fmt: str) -> None:
+    """Validate compiled IR against a MetricFlow schema.
+
+    \b
+    Exit codes:
+      0 — all checks passed
+      1 — one or more errors (invalid references, missing fields)
+      2 — warnings only (opaque metrics, missing descriptions)
+          With --strict, warnings become errors and exit code is 1.
+
+    \b
+    Examples:
+      omx validate --format metricflow
+      omx validate --format metricflow --strict
+      omx validate --format metricflow --strict --output json
+    """
+    from onlymetrix.validate import run_validate
+    try:
+        with _get_client() as om:
+            exit_code = run_validate(fmt=fmt, strict=strict, output_fmt=output_fmt, client=om)
+            sys.exit(exit_code)
     except OnlyMetrixError as e:
         _handle_error(e)
 
@@ -804,6 +962,700 @@ def analysis_load(ctx: click.Context, name: str) -> None:
             _output(result, ctx.obj["pretty"])
     except OnlyMetrixError as e:
         _handle_error(e)
+
+
+# ── dbt ──────────────────────────────────────────────────────────────
+
+
+@cli.group()
+def dbt() -> None:
+    """dbt integration — sync metrics from dbt to OnlyMetrix."""
+
+
+@dbt.command("connect")
+@click.option("--profiles-dir", default=None, type=click.Path(), help="Directory containing profiles.yml")
+@click.option("--project-dir", default=None, type=click.Path(), help="dbt project directory")
+@click.option("--profile", default=None, help="Profile name (default: from dbt_project.yml)")
+@click.option("--target", default=None, help="Target name (default: profile's default)")
+@click.option("--name", "ds_name", default=None, help="Datasource name in OM (default: 'default')")
+@click.option("--dry-run", is_flag=True, default=False, help="Show what would connect without calling API")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt")
+@click.option("--url", default=None, help="OnlyMetrix API URL (overrides OMX_API_URL)")
+@click.option("--api-key", default=None, help="OnlyMetrix API key (overrides OMX_API_KEY)")
+@click.pass_context
+def dbt_connect(
+    ctx: click.Context,
+    profiles_dir: str | None,
+    project_dir: str | None,
+    profile: str | None,
+    target: str | None,
+    ds_name: str | None,
+    dry_run: bool,
+    yes: bool,
+    url: str | None,
+    api_key: str | None,
+) -> None:
+    """Connect your dbt warehouse to OnlyMetrix.
+
+    Reads profiles.yml (same credentials dbt uses) and registers
+    the datasource with OnlyMetrix.
+
+    \b
+    Usage:
+      omx dbt connect              # reads ~/.dbt/profiles.yml
+      omx dbt connect --dry-run    # preview without connecting
+      omx dbt connect -y           # skip confirmation
+    """
+    from onlymetrix.dbt import find_profiles, parse_profiles
+
+    # 1. Find profiles.yml
+    try:
+        profiles_path = find_profiles(profiles_dir, project_dir)
+    except FileNotFoundError as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+
+    click.echo(f"Reading {profiles_path}")
+
+    # 2. Parse profile + target
+    try:
+        db_profile = parse_profiles(profiles_path, profile, target, project_dir)
+    except (ValueError, EnvironmentError, ImportError) as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    # 2b. Apply name override
+    if ds_name:
+        db_profile.name_override = ds_name
+
+    # 3. Show what was found
+    click.echo("")
+    click.echo(db_profile.display_summary())
+    click.echo("")
+
+    if dry_run:
+        click.echo("--dry-run: would connect this datasource to OnlyMetrix")
+        click.echo(f"Datasource name: {db_profile.datasource_name}")
+        return
+
+    # 4. Confirmation
+    if not yes:
+        click.echo("These credentials will be sent to OnlyMetrix to")
+        click.echo("execute metric queries against your warehouse.")
+        click.echo("")
+        if not click.confirm("Connect?"):
+            click.echo("Cancelled.")
+            return
+
+    # 5. Connect
+    if url:
+        os.environ["OMX_API_URL"] = url
+    if api_key:
+        os.environ["OMX_API_KEY"] = api_key
+
+    try:
+        with _get_client() as om:
+            result = om.setup.connect_warehouse(**db_profile.to_connect_payload())
+            status = result.get("status", "unknown")
+            if status == "healthy":
+                click.echo(f"\nConnected: {db_profile.datasource_name} ({db_profile.ds_type})")
+                click.echo("Run `omx dbt sync` to register your metrics.")
+            elif status == "configured":
+                click.echo(f"\nConfigured: {db_profile.datasource_name} ({db_profile.ds_type})")
+                click.echo("Connection saved but could not verify. Check credentials.")
+            else:
+                click.echo(f"\nResult: {json.dumps(result)}")
+    except OnlyMetrixError as e:
+        click.echo(f"Connection failed: {e.message}", err=True)
+        sys.exit(1)
+
+
+@dbt.command("sync")
+@click.option("--manifest", default=None, type=click.Path(), help="Path to manifest.json")
+@click.option("--project-dir", default=None, type=click.Path(), help="dbt project directory")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview sync without calling API")
+@click.option("--strict", is_flag=True, default=False, help="Exit non-zero if any metric is opaque or failed")
+@click.option("--url", default=None, help="OnlyMetrix API URL (overrides OMX_API_URL)")
+@click.option("--api-key", default=None, help="OnlyMetrix API key (overrides OMX_API_KEY)")
+@click.pass_context
+def dbt_sync(
+    ctx: click.Context,
+    manifest: str | None,
+    project_dir: str | None,
+    dry_run: bool,
+    strict: bool,
+    url: str | None,
+    api_key: str | None,
+) -> None:
+    """Sync dbt metrics to OnlyMetrix.
+
+    Reads target/manifest.json, extracts metric definitions, translates
+    MetricFlow types to SQL, and syncs to the OM API.
+
+    \b
+    Usage:
+      dbt run
+      omx dbt sync              # sync to OM
+      omx dbt sync --dry-run    # preview without syncing
+    """
+    from onlymetrix.dbt import (
+        find_manifest,
+        parse_manifest,
+        compute_sync_plan,
+        format_dry_run,
+        load_sync_state,
+        save_sync_state,
+    )
+
+    # 1. Find manifest
+    try:
+        manifest_path = find_manifest(manifest, project_dir)
+    except FileNotFoundError as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+
+    target_dir = manifest_path.parent
+    click.echo(f"Reading {manifest_path}")
+
+    # 2. Parse metrics
+    try:
+        metrics = parse_manifest(manifest_path)
+    except Exception as e:
+        click.echo(f"Failed to parse manifest: {e}", err=True)
+        sys.exit(1)
+
+    if not metrics:
+        click.echo("No metrics found in manifest.")
+        return
+
+    # 3. Compute sync plan
+    prev_state = load_sync_state(target_dir)
+    actions = compute_sync_plan(metrics, prev_state)
+
+    # 4. Dry-run: print and exit
+    if dry_run:
+        click.echo(format_dry_run(actions))
+        if strict:
+            opaque_or_failed = [a for a in actions if a.metric.compile_hint in ("opaque", "failed")]
+            if opaque_or_failed:
+                click.echo(f"\n--strict: {len(opaque_or_failed)} metric(s) are not structured", err=True)
+                sys.exit(1)
+        return
+
+    # 5. Live sync
+    to_sync = [a for a in actions if a.action in ("create", "update")]
+    if not to_sync:
+        click.echo(f"All {len(actions)} metrics unchanged. Nothing to sync.")
+        return
+
+    # Override client config if provided
+    if url:
+        os.environ["OMX_API_URL"] = url
+    if api_key:
+        os.environ["OMX_API_KEY"] = api_key
+
+    payloads = [a.metric.to_api_payload() for a in to_sync]
+
+    try:
+        with _get_client() as om:
+            resp = om._client.post(
+                "/v1/metrics/sync-dbt",
+                json={"metrics": payloads},
+            )
+            if resp.status_code >= 400:
+                try:
+                    error_body = resp.json()
+                except Exception:
+                    error_body = {"error": resp.text}
+                click.echo(json.dumps({"error": error_body, "status": resp.status_code}), err=True)
+                sys.exit(1)
+            result = resp.json()
+    except Exception as e:
+        click.echo(f"Sync failed: {e}", err=True)
+        sys.exit(1)
+
+    # 6. Save sync state
+    new_state = {m.name: m.hash_key() for m in metrics}
+    save_sync_state(target_dir, new_state)
+
+    # 7. Report results
+    synced = result.get("synced", 0)
+    created = result.get("created", 0)
+    updated = result.get("updated", 0)
+    compile_results = result.get("compile_results", {})
+    structured = compile_results.get("structured", 0)
+    opaque = compile_results.get("opaque", 0)
+    failed = compile_results.get("failed", 0)
+    tier_updates = result.get("tier_updates", 0)
+
+    click.echo(f"\nSynced {synced} metrics ({created} created, {updated} updated)")
+    click.echo(f"Compile: {structured} structured, {opaque} opaque, {failed} failed")
+    if tier_updates:
+        click.echo(f"Tier updates: {tier_updates}")
+
+    unchanged_count = len(actions) - len(to_sync)
+    if unchanged_count:
+        click.echo(f"Skipped: {unchanged_count} unchanged")
+
+    if strict and (opaque > 0 or failed > 0):
+        click.echo(f"\n--strict: {opaque + failed} metric(s) are not structured", err=True)
+        sys.exit(1)
+
+
+# ── Reliability ──────────────────────────────────────────────────────
+
+
+# Colour helpers — degrade gracefully when piped
+def _red(s: str) -> str: return click.style(s, fg="red")
+def _yellow(s: str) -> str: return click.style(s, fg="yellow")
+def _green(s: str) -> str: return click.style(s, fg="green")
+def _dim(s: str) -> str: return click.style(s, dim=True)
+def _bold(s: str) -> str: return click.style(s, bold=True)
+
+
+def _status_icon(status: str) -> str:
+    icons = {
+        "healthy": _green("OK"),
+        "degraded": _yellow("!!"),
+        "unreliable": _red("XX"),
+    }
+    return icons.get(status, _dim("??"))
+
+
+def _severity_icon(severity: str) -> str:
+    icons = {
+        "critical": _red("XX"),
+        "high": _red("XX"),
+        "medium": _yellow("!!"),
+        "low": _dim("--"),
+    }
+    return icons.get(severity, _dim("  "))
+
+
+def _pad(s: str, width: int) -> str:
+    """Pad a string to width based on visible length (ignoring ANSI codes)."""
+    import re
+    visible_len = len(re.sub(r"\x1b\[[0-9;]*m", "", s))
+    return s + " " * max(0, width - visible_len)
+
+
+@cli.group()
+def reliability() -> None:
+    """Metric reliability — trace broken data to affected decisions."""
+
+
+@reliability.command("check")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON output")
+@click.option("--quiet", is_flag=True, help="Exit code only (0 = all healthy, 1 = issues)")
+@click.pass_context
+def reliability_check(ctx: click.Context, as_json: bool, quiet: bool) -> None:
+    """Run all reliability checks. Show which metrics you can trust."""
+    try:
+        with _get_client() as om:
+            data = om.reliability.status(detail=True)
+    except OnlyMetrixError as e:
+        if quiet:
+            sys.exit(1)
+        _handle_error(e)
+        return
+
+    if as_json:
+        _output(data, ctx.obj.get("pretty", False))
+        return
+
+    summary = data.get("summary", {})
+    metrics = data.get("metrics", [])
+    total = summary.get("total", 0)
+    healthy = summary.get("healthy", 0)
+    degraded = summary.get("degraded", 0)
+    unreliable = summary.get("unreliable", 0)
+
+    if quiet:
+        sys.exit(0 if unreliable == 0 and degraded == 0 else 1)
+
+    # Header
+    click.echo()
+    click.echo(_bold("METRIC RELIABILITY STATUS"))
+    click.echo()
+
+    # Summary
+    click.echo(f"  {_green(str(healthy))} healthy    {_yellow(str(degraded))} degraded    {_red(str(unreliable))} unreliable    {_dim(str(total) + ' total')}")
+    click.echo()
+
+    if unreliable == 0 and degraded == 0:
+        click.echo(f"  {_green('All metrics are reliable.')} No action needed.")
+        click.echo()
+        return
+
+    # Show issues
+    for m in metrics:
+        status = m.get("status", "unknown")
+        if status == "healthy":
+            continue
+        name = m.get("metric_name", "?")
+        violations = m.get("violations", [])
+
+        click.echo(f"  {_status_icon(status)} {_bold(name)}  —  {status.upper()}")
+        for v in violations:
+            sev = v.get("severity", "")
+            desc = v.get("description", "")
+            click.echo(f"      {_severity_icon(sev)} {desc}")
+        click.echo()
+
+    # Suggest next command
+    first_unreliable = next((m for m in metrics if m.get("status") == "unreliable"), None)
+    if first_unreliable:
+        name = first_unreliable.get("metric_name", "?")
+        click.echo(_dim(f"  → omx reliability trace --metric {name}"))
+        click.echo(_dim(f"  → omx reliability watch --metric {name}"))
+    click.echo()
+
+
+@reliability.command("trace")
+@click.option("--metric", required=True, help="Metric name to trace")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON output")
+@click.pass_context
+def reliability_trace(ctx: click.Context, metric: str, as_json: bool) -> None:
+    """Trace the full dependency chain for one metric."""
+    try:
+        with _get_client() as om:
+            data = om.reliability.status_metric(metric, detail=True)
+    except OnlyMetrixError as e:
+        _handle_error(e)
+        return
+
+    if as_json:
+        _output(data, ctx.obj.get("pretty", False))
+        return
+
+    status = data.get("status", "unknown")
+    safe = data.get("safe_to_use", True)
+    violations = data.get("violations", [])
+    warning = data.get("warning")
+    confidence = data.get("confidence", "unknown")
+
+    click.echo()
+    click.echo(f"  {_status_icon(status)} {_bold(metric)}  —  {status.upper()}")
+    click.echo()
+
+    if violations:
+        click.echo("  Issues:")
+        for v in violations:
+            sev = v.get("severity", "")
+            desc = v.get("description", "")
+            table = v.get("source_table", "")
+            col = v.get("source_column", "")
+            source = f"{table}" + (f".{col}" if col else "")
+            click.echo(f"    {_severity_icon(sev)} {desc}")
+            if source and source != ".":
+                click.echo(f"      {_dim('Source: ' + source)}")
+        click.echo()
+
+    click.echo(f"  Safe to use:  {_green('YES') if safe else _red('NO')}")
+    click.echo(f"  Confidence:   {confidence}")
+    if warning:
+        click.echo(f"  Warning:      {warning}")
+    click.echo()
+
+    if not safe:
+        click.echo(_dim(f"  → omx reliability watch --metric {metric}"))
+        click.echo(_dim("    (waits until metric is reliable again)"))
+    click.echo()
+
+
+@reliability.command("watch")
+@click.option("--metric", required=True, help="Metric name to watch")
+@click.option("--interval", default=60, type=int, help="Poll interval in seconds (default: 60)")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON output")
+def reliability_watch(metric: str, interval: int, as_json: bool) -> None:
+    """Poll until a metric becomes reliable. Ctrl+C to cancel."""
+    import time
+    from datetime import datetime
+
+    # Gate: try to subscribe (Team-gated endpoint) to verify plan access.
+    # If 402, show upgrade prompt before starting the poll loop.
+    om = _get_client()
+    try:
+        om.reliability.subscribe(metric, "cli_watch", "poll")
+    except OnlyMetrixError as e:
+        if e.status_code == 402:
+            click.echo()
+            click.echo(f"  {_yellow('omx reliability watch')} requires the {_bold('Team')} plan.")
+            click.echo(f"  Get notified automatically when metrics recover.")
+            click.echo()
+            click.echo(f"  {_dim('onlymetrix.com/pricing')}")
+            click.echo()
+            sys.exit(1)
+        # Other errors (404, 500) are fine — we'll still poll
+
+    click.echo()
+    click.echo(f"  Watching {_bold(metric)} — polling every {interval}s")
+    click.echo(f"  {_dim('Ctrl+C to cancel')}")
+    click.echo()
+
+    try:
+        while True:
+            try:
+                data = om.reliability.status_metric(metric, detail=True)
+            except OnlyMetrixError:
+                ts = datetime.now().strftime("%H:%M:%S")
+                click.echo(f"  {_dim(ts)}  {_red('ERROR')}  Could not reach API")
+                time.sleep(interval)
+                continue
+
+            status = data.get("status", "unknown")
+            safe = data.get("safe_to_use", False)
+            ts = datetime.now().strftime("%H:%M:%S")
+
+            if as_json:
+                click.echo(json.dumps({"timestamp": ts, "metric": metric, "status": status, "safe_to_use": safe}))
+            else:
+                click.echo(f"  {_dim(ts)}  {_status_icon(status)}  {metric}  —  {status}")
+
+            if status == "healthy":
+                click.echo()
+                click.echo(f"  {_green('OK')} {_bold(metric)} is now reliable.")
+                click.echo()
+                om.close()
+                sys.exit(0)
+
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        click.echo()
+        click.echo(_dim("  Stopped watching."))
+        click.echo()
+    finally:
+        om.close()
+
+
+@reliability.command("affected-by")
+@click.option("--table", required=True, help="Table name to check impact for")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON output")
+@click.option("--quiet", is_flag=True, help="Exit code only (0 = no impact, 1 = metrics affected)")
+@click.pass_context
+def reliability_affected_by(ctx: click.Context, table: str, as_json: bool, quiet: bool) -> None:
+    """Trace a broken table to every affected metric and decision.
+
+    This is the command every data analyst wishes existed.
+    """
+    try:
+        with _get_client() as om:
+            data = om.reliability.affected_by(table)
+    except OnlyMetrixError as e:
+        if quiet:
+            sys.exit(1)
+        _handle_error(e)
+        return
+
+    if as_json:
+        _output(data, ctx.obj.get("pretty", False))
+        return
+
+    affected = data.get("affected_metrics", [])
+    table_status = data.get("table_status", "unknown")
+    table_violations = data.get("table_violations", [])
+    safe = data.get("safe_to_use", True)
+
+    if quiet:
+        sys.exit(0 if safe else 1)
+
+    # ── The output that gets screenshotted ──
+    click.echo()
+
+    # Table status line
+    if table_violations:
+        worst = table_violations[0]
+        vtype = worst.get("violation_type", "issue").upper().replace("_", " ")
+        desc = worst.get("description", "")
+        click.echo(f"  Table: {_bold(table)} — {_red(vtype)}")
+        click.echo(f"  {desc}")
+    else:
+        status_str = table_status.upper()
+        color_fn = _red if table_status in ("unreliable", "at_risk") else _yellow if table_status == "degraded" else _green
+        click.echo(f"  Table: {_bold(table)} — {color_fn(status_str)}")
+    click.echo()
+
+    if not affected:
+        click.echo(f"  {_green('No affected metrics.')} This table is not in any metric dependency chain.")
+        click.echo()
+        return
+
+    # Affected metrics
+    click.echo("  Affected metrics:")
+    for m in affected:
+        name = m.get("metric_name", "?")
+        dep_type = m.get("dependency_type", "unknown")
+        m_safe = m.get("safe_to_use", True)
+        icon = _red("XX") if not m_safe else _yellow("!!")
+        dep_label = f"({dep_type} dependency)" if dep_type == "direct" else f"(transitive — via dependency chain)"
+        click.echo(f"    {icon} {_pad(_bold(name), 30)} {_dim(dep_label)}")
+    click.echo()
+
+    # Safe to use verdict
+    click.echo(f"  Safe to use: {_red('NO') if not safe else _green('YES')}")
+    click.echo()
+
+    # Upsell: suggest watch (Team feature)
+    if affected:
+        first = affected[0].get("metric_name", "?")
+        click.echo(f"  Run: {_dim('omx reliability watch --metric ' + first)}")
+        click.echo(f"       {_dim('to be notified when this clears')} {_yellow('[Team]')}")
+    click.echo()
+
+
+# ── SQL Converter ────────────────────────────────────────────────────
+
+
+@cli.group("sql")
+def sql_group():
+    """Convert raw SQL into semantic layer metric definitions."""
+    pass
+
+
+@sql_group.command("convert")
+@click.argument("sql_input")
+@click.option("--name", "-n", default=None, help="Metric name (auto-inferred from SQL if not provided)")
+@click.option("--description", "-d", default=None, help="Metric description")
+@click.option("--tags", "-t", default=None, help="Comma-separated tags")
+@click.option("--format", "fmt", type=click.Choice(["json", "yaml"]), default="json", help="Output format")
+@click.option("--import", "do_import", is_flag=True, default=False, help="Import the metric into OnlyMetrix")
+@click.option("--url", default=None, help="OnlyMetrix server URL")
+@click.option("--api-key", default=None, help="API key")
+@click.pass_context
+def sql_convert(ctx, sql_input, name, description, tags, fmt, do_import, url, api_key):
+    """Convert a SQL query or .sql file into a metric definition.
+
+    SQL_INPUT can be a raw SQL string or a path to a .sql file.
+    """
+    from pathlib import Path
+    from onlymetrix.sql_converter import convert_sql, convert_sql_file, extract_sql, metrics_to_yaml
+
+    tag_list = [t.strip() for t in tags.split(",")] if tags else None
+
+    # Detect if input is a file path
+    input_path = Path(sql_input)
+    if input_path.exists() and input_path.suffix == ".sql":
+        metric = convert_sql_file(input_path, name=name, description=description)
+        extracted = extract_sql(input_path.read_text(), name=name, description=description, tags=tag_list)
+    else:
+        metric = convert_sql(sql_input, name=name, description=description, tags=tag_list)
+        extracted = extract_sql(sql_input, name=name, description=description, tags=tag_list)
+
+    # Show warnings
+    if extracted.warnings:
+        for w in extracted.warnings:
+            click.echo(f"  Warning: {w}", err=True)
+
+    # Output
+    if fmt == "yaml":
+        click.echo(metrics_to_yaml([metric]))
+    else:
+        pretty = ctx.obj.get("pretty", False)
+        _output(metric, pretty=pretty)
+
+    # Optionally import
+    if do_import:
+        try:
+            with _get_client(url=url, api_key=api_key) as om:
+                result = om.setup.import_metrics([metric])
+                click.echo(f"\nImported: {metric['name']}")
+                click.echo(json.dumps(result, default=str))
+        except OnlyMetrixError as e:
+            _handle_error(e)
+
+
+@sql_group.command("convert-batch")
+@click.argument("directory")
+@click.option("--pattern", "-p", default="*.sql", help="File glob pattern (default: *.sql)")
+@click.option("--output", "-o", default=None, help="Output file path (.json or .yaml)")
+@click.option("--format", "fmt", type=click.Choice(["json", "yaml"]), default="json", help="Output format")
+@click.option("--import", "do_import", is_flag=True, default=False, help="Import all metrics into OnlyMetrix")
+@click.option("--url", default=None, help="OnlyMetrix server URL")
+@click.option("--api-key", default=None, help="API key")
+@click.pass_context
+def sql_convert_batch(ctx, directory, pattern, output, fmt, do_import, url, api_key):
+    """Convert all .sql files in a directory into metric definitions.
+
+    Each SQL file becomes one metric, named after the filename.
+    """
+    from pathlib import Path
+    from onlymetrix.sql_converter import convert_sql_directory, metrics_to_yaml
+
+    try:
+        metrics = convert_sql_directory(directory, pattern=pattern)
+    except ValueError as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+
+    if not metrics:
+        click.echo("No SQL files found.", err=True)
+        sys.exit(1)
+
+    click.echo(f"Converted {len(metrics)} SQL files into metric definitions")
+
+    # Format output
+    if fmt == "yaml":
+        content = metrics_to_yaml(metrics)
+    else:
+        content = json.dumps(metrics, indent=2, default=str)
+
+    # Write or print
+    if output:
+        out_path = Path(output)
+        out_path.write_text(content, encoding="utf-8")
+        click.echo(f"Written: {out_path}")
+    else:
+        click.echo(content)
+
+    # Optionally import
+    if do_import:
+        try:
+            with _get_client(url=url, api_key=api_key) as om:
+                result = om.setup.import_metrics(metrics)
+                click.echo(f"\nImported {len(metrics)} metrics")
+                click.echo(json.dumps(result, default=str))
+        except OnlyMetrixError as e:
+            _handle_error(e)
+
+
+@sql_group.command("inspect")
+@click.argument("sql_input")
+@click.option("--name", "-n", default=None, help="Metric name")
+@click.pass_context
+def sql_inspect(ctx, sql_input, name):
+    """Inspect what would be extracted from a SQL query.
+
+    Shows aggregations, tables, filters, dimensions, and time columns
+    detected in the SQL — useful for debugging before import.
+    """
+    from pathlib import Path
+    from onlymetrix.sql_converter import extract_sql
+
+    input_path = Path(sql_input)
+    if input_path.exists() and input_path.suffix == ".sql":
+        sql = input_path.read_text()
+        name = name or input_path.stem
+    else:
+        sql = sql_input
+
+    extracted = extract_sql(sql, name=name)
+
+    click.echo(f"  Name:         {extracted.name}")
+    click.echo(f"  Description:  {extracted.description}")
+    click.echo(f"  Tables:       {', '.join(extracted.source_tables) or '(none)'}")
+    click.echo(f"  Aggregations: {len(extracted.aggregations)}")
+    for agg in extracted.aggregations:
+        click.echo(f"    - {agg['function']}({agg['expression']}) AS {agg['alias']}")
+    click.echo(f"  Dimensions:   {', '.join(extracted.dimensions) or '(none)'}")
+    click.echo(f"  Time column:  {extracted.time_column or '(not detected)'}")
+    click.echo(f"  Filters:      {len(extracted.filters)}")
+    for f in extracted.filters:
+        click.echo(f"    - {f['name']} ({f['type']})")
+    click.echo(f"  Tags:         {', '.join(extracted.tags) or '(none)'}")
+    if extracted.warnings:
+        click.echo(f"  Warnings:")
+        for w in extracted.warnings:
+            click.echo(f"    ! {w}")
 
 
 if __name__ == "__main__":

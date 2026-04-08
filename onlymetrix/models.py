@@ -5,6 +5,14 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
+def _require(data: dict, key: str, cls_name: str) -> Any:
+    """Get a required key from a dict with a clear error message."""
+    try:
+        return data[key]
+    except KeyError:
+        raise ValueError(f"{cls_name}.from_dict: missing required field '{key}'") from None
+
+
 @dataclass
 class Metric:
     """A curated metric definition."""
@@ -27,8 +35,8 @@ class Metric:
     @classmethod
     def from_dict(cls, data: dict) -> Metric:
         return cls(
-            name=data["name"],
-            description=data["description"],
+            name=_require(data, "name", "Metric"),
+            description=_require(data, "description", "Metric"),
             filters=data.get("filters", []),
             tags=data.get("tags", []),
             open_filters=data.get("open_filters", False),
@@ -59,11 +67,11 @@ class MetricResult:
     @classmethod
     def from_dict(cls, data: dict) -> MetricResult:
         return cls(
-            metric=data["metric"],
-            columns=data["columns"],
-            rows=data["rows"],
-            row_count=data["row_count"],
-            execution_time_ms=data["execution_time_ms"],
+            metric=data.get("metric", ""),
+            columns=data.get("columns", []),
+            rows=data.get("rows", []),
+            row_count=data.get("row_count", 0),
+            execution_time_ms=data.get("execution_time_ms", 0),
             filters_applied=data.get("filters_applied", []),
             warning=data.get("warning"),
         )
@@ -81,11 +89,11 @@ class QueryResult:
     @classmethod
     def from_dict(cls, data: dict) -> QueryResult:
         return cls(
-            columns=data["columns"],
-            rows=data["rows"],
-            row_count=data["row_count"],
-            execution_time_ms=data["execution_time_ms"],
-            executed_sql=data["executed_sql"],
+            columns=_require(data, "columns", "QueryResult"),
+            rows=_require(data, "rows", "QueryResult"),
+            row_count=_require(data, "row_count", "QueryResult"),
+            execution_time_ms=_require(data, "execution_time_ms", "QueryResult"),
+            executed_sql=_require(data, "executed_sql", "QueryResult"),
         )
 
 
@@ -100,8 +108,8 @@ class Table:
     @classmethod
     def from_dict(cls, data: dict) -> Table:
         return cls(
-            schema=data["schema"],
-            table=data["table"],
+            schema=_require(data, "schema", "Table"),
+            table=_require(data, "table", "Table"),
             estimated_rows=data.get("estimated_rows"),
             description=data.get("description"),
         )
@@ -119,8 +127,8 @@ class Column:
     @classmethod
     def from_dict(cls, data: dict) -> Column:
         return cls(
-            name=data["name"],
-            type=data["type"],
+            name=_require(data, "name", "Column"),
+            type=_require(data, "type", "Column"),
             nullable=data.get("nullable", True),
             is_pii=data.get("is_pii", False),
             description=data.get("description"),
@@ -138,10 +146,10 @@ class TableDescription:
     @classmethod
     def from_dict(cls, data: dict) -> TableDescription:
         return cls(
-            schema=data["schema"],
-            table=data["table"],
+            schema=_require(data, "schema", "TableDescription"),
+            table=_require(data, "table", "TableDescription"),
             description=data.get("description"),
-            columns=[Column.from_dict(c) for c in data["columns"]],
+            columns=[Column.from_dict(c) for c in _require(data, "columns", "TableDescription")],
         )
 
 
@@ -162,10 +170,10 @@ class MetricRequest:
     @classmethod
     def from_dict(cls, data: dict) -> MetricRequest:
         return cls(
-            id=data["id"],
-            description=data["description"],
-            request_count=data["request_count"],
-            status=data["status"],
+            id=_require(data, "id", "MetricRequest"),
+            description=_require(data, "description", "MetricRequest"),
+            request_count=_require(data, "request_count", "MetricRequest"),
+            status=_require(data, "status", "MetricRequest"),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
             example_query=data.get("example_query"),

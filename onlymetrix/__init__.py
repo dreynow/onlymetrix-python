@@ -1,8 +1,9 @@
 from onlymetrix.client import OnlyMetrix, AsyncOnlyMetrix, OnlyMetrixError
 from onlymetrix.models import Metric, MetricResult, MetricRequest, QueryResult, Table, Column, TableDescription
 from onlymetrix.analysis import Analysis
+from onlymetrix.sql_converter import convert_sql, convert_sql_batch, extract_sql
 
-__version__ = "0.2.0"
+__version__ = "0.4.2"
 __all__ = [
     "OnlyMetrix",
     "AsyncOnlyMetrix",
@@ -15,4 +16,7 @@ __all__ = [
     "Table",
     "Column",
     "TableDescription",
+    "convert_sql",
+    "convert_sql_batch",
+    "extract_sql",
 ]

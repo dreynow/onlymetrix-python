@@ -1,9 +1,15 @@
 """OnlyMetrix Python SDK - governed data access for AI agents."""
 
 from __future__ import annotations
+
+import asyncio
+import logging
+import time
 from typing import Any, Optional
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from onlymetrix.models import (
     Metric,
@@ -53,8 +59,26 @@ class _MetricsResource:
         filters: Optional[dict[str, str]] = None,
         dimension: Optional[str] = None,
         limit: Optional[int] = None,
-    ) -> MetricResult:
-        """Execute a metric by name with optional filters."""
+        period: Optional[str] = None,
+    ) -> "MetricResult | dict":
+        """Execute a metric by name with optional filters.
+
+        Args:
+            name: Metric name.
+            filters: Key-value filter pairs.
+            dimension: Dimension to group by.
+            limit: Row limit.
+            period: Semantic period resolved against tenant fiscal calendar.
+                Single periods: today, yesterday, wtd, mtd, qtd, ytd,
+                    last_7d, last_30d, last_week, last_month, last_year,
+                    range:YYYY-MM-DD,YYYY-MM-DD
+                Comparison periods: dod, wow, mom, qoq, yoy
+                    Returns current + previous + change_pct + direction.
+
+        Returns:
+            MetricResult for single periods, dict for comparison periods
+            (with current, previous, and comparison sections).
+        """
         body: dict[str, Any] = {}
         if filters:
             body["filters"] = filters
@@ -62,9 +86,15 @@ class _MetricsResource:
             body["dimension"] = dimension
         if limit is not None:
             body["limit"] = limit
+        if period:
+            body["period"] = period
 
         resp = self._client.post(f"{self._base}/v1/metrics/{name}", json=body)
         data = _handle_response(resp)
+
+        # Comparison periods return a different shape
+        if period and data.get("comparison"):
+            return data
         return MetricResult.from_dict(data)
 
     def get(self, name: str) -> Optional[Metric]:
@@ -312,9 +342,69 @@ class _CompilerResource:
         self._base = base_url
 
     def status(self) -> dict:
-        """Get compiler status."""
+        """Get compiler status — full IR for all compiled metrics."""
         resp = self._client.get(f"{self._base}/v1/compiler/status")
         return _handle_response(resp)
+
+    def inspect(self, metric_name: str) -> dict | None:
+        """Get full IR for a single metric. Returns None if not found."""
+        data = self.status()
+        for m in data.get("metrics", []):
+            if m.get("name") == metric_name:
+                return m
+        return None
+
+    def agent_context(self, query: str | None = None, top_k: int = 10) -> str:
+        """Emit prompt-ready IR context for LLM agent injection.
+
+        If query is given, sorts metrics by relevance (keyword match on name/tags/description).
+        Returns a formatted string ready to inject into a system prompt.
+        """
+        data = self.status()
+        metrics = data.get("metrics", [])
+
+        # Simple relevance scoring if query provided
+        if query:
+            q_lower = query.lower()
+            def score(m: dict) -> float:
+                s = 0.0
+                name = m.get("name", "")
+                if q_lower in name.lower():
+                    s += 10
+                for tag in m.get("semantic", {}).get("tags", []):
+                    if q_lower in tag.lower():
+                        s += 5
+                desc = m.get("semantic", {}).get("description", "")
+                if q_lower in desc.lower():
+                    s += 3
+                s += m.get("semantic", {}).get("importance", 0)
+                if m.get("semantic", {}).get("is_primary"):
+                    s += 5
+                return s
+            metrics = sorted(metrics, key=score, reverse=True)
+
+        metrics = metrics[:top_k]
+        lines: list[str] = ["METRIC IR (compiled from warehouse):"]
+        for m in metrics:
+            sem = m.get("semantic", {})
+            measures = m.get("measures", [])
+            measure_str = ", ".join(f"{ms['function']}({ms['alias']})" for ms in measures) if measures else m.get("kind", "")
+            parts = [m["name"], f"  type: {measure_str}"]
+            joins = m.get("joins", [])
+            if joins:
+                parts.append(f"  entity: {', '.join(j['from'] + ' → ' + j['to'] for j in joins)}")
+            dims = m.get("dimensions", [])
+            if dims:
+                parts.append(f"  dimensions: [{', '.join(d['name'] for d in dims)}]")
+            tax = sem.get("taxonomy_path")
+            if tax:
+                parts.append(f"  taxonomy: {tax}")
+            parts.append(f"  importance: {sem.get('importance', 0)}/10{' · primary' if sem.get('is_primary') else ''}")
+            related = [e["target"] for e in sem.get("ontology", []) if e["relation"] in ("RELATED_TO", "INVERSELY_RELATED")]
+            if related:
+                parts.append(f"  related: [{', '.join(related)}]")
+            lines.append("\n".join(parts))
+        return "\n\n".join(lines)
 
     def import_format(
         self, format: str, content: Any, apply: bool = False
@@ -356,6 +446,95 @@ class _CustomAnalysisApiResource:
         resp = self._client.delete(f"{self._base}/v1/analysis/custom/{name}")
         return _handle_response(resp)
 
+    def run(self, name: str, metric: str, **params) -> dict:
+        """Execute a custom analysis DAG server-side.
+
+        Returns step results with status (completed/skipped/error) for each step.
+        Primitives not available server-side are marked as skipped.
+        """
+        body: dict[str, Any] = {"metric": metric, "params": params}
+        resp = self._client.post(f"{self._base}/v1/analysis/custom/{name}/run", json=body)
+        return _handle_response(resp)
+
+
+class _AnalysisResource:
+    """Server-side analysis operations."""
+
+    def __init__(self, client: httpx.Client, base_url: str):
+        self._client = client
+        self._base = base_url
+
+    def correlate(self, metric_a: str, metric_b: str, limit: int = 5000) -> dict:
+        """Server-side entity correlation (PII-safe).
+
+        Computes Jaccard overlap on unmasked data server-side.
+        Returns only aggregate statistics — no raw entity IDs.
+        """
+        body: dict[str, Any] = {"metric_a": metric_a, "metric_b": metric_b, "limit": limit}
+        resp = self._client.post(f"{self._base}/v1/analysis/correlate", json=body)
+        return _handle_response(resp)
+
+
+class _ReliabilityResource:
+    """Metric reliability operations."""
+
+    def __init__(self, client: httpx.Client, base_url: str):
+        self._client = client
+        self._base = base_url
+
+    def status(self, detail: bool = False) -> dict:
+        """Get reliability status for all metrics."""
+        url = f"{self._base}/v1/reliability/status"
+        if detail:
+            url += "?detail=true"
+        resp = self._client.get(url)
+        return _handle_response(resp)
+
+    def status_metric(self, name: str, detail: bool = False) -> dict:
+        """Get reliability status for a single metric."""
+        url = f"{self._base}/v1/reliability/status/{name}"
+        if detail:
+            url += "?detail=true"
+        resp = self._client.get(url)
+        return _handle_response(resp)
+
+    def alerts(self) -> dict:
+        """Get active reliability alerts."""
+        resp = self._client.get(f"{self._base}/v1/reliability/alerts")
+        return _handle_response(resp)
+
+    def affected_by(self, table: str) -> dict:
+        """Find all metrics affected by a table issue.
+
+        Walks the IR dependency graph from the given table to find
+        all directly and transitively affected metrics.
+        """
+        resp = self._client.get(f"{self._base}/v1/reliability/affected-by/{table}")
+        return _handle_response(resp)
+
+    def subscribe(self, metric: str, channel: str, target: str) -> dict:
+        """Subscribe to be notified when a metric becomes healthy again."""
+        resp = self._client.post(
+            f"{self._base}/v1/reliability/notify/{metric}",
+            json={"channel": channel, "target": target},
+        )
+        return _handle_response(resp)
+
+    def configure(self, metric: str, **kwargs) -> dict:
+        """Configure reliability contract for a metric."""
+        body = {}
+        if "freshness_sla_secs" in kwargs:
+            body["freshness_sla_secs"] = kwargs["freshness_sla_secs"]
+        if "baseline_row_count" in kwargs:
+            body["baseline_row_count"] = kwargs["baseline_row_count"]
+        if "baseline_null_rates" in kwargs:
+            body["baseline_null_rates"] = kwargs["baseline_null_rates"]
+        resp = self._client.post(
+            f"{self._base}/v1/reliability/configure/{metric}",
+            json=body,
+        )
+        return _handle_response(resp)
+
 
 class _AutoresearchResource:
     """Autoresearch operations."""
@@ -370,6 +549,8 @@ class _AutoresearchResource:
         ground_truth_sql: Optional[str] = None,
         max_variations: Optional[int] = None,
         filters: Optional[dict[str, str]] = None,
+        poll_interval: float = 1.5,
+        poll_timeout: float = 300.0,
     ) -> dict:
         """Run autoresearch on a metric.
 
@@ -379,6 +560,8 @@ class _AutoresearchResource:
             max_variations: Max variants to test.
             filters: Segment filters — narrows both seed SQL and ground truth
                 to a specific segment (e.g., {"tier": "enterprise"}).
+            poll_interval: Seconds between status polls (default 1.5).
+            poll_timeout: Max seconds to wait for completion (default 300).
         """
         body: dict[str, Any] = {"metric_name": metric_name}
         if ground_truth_sql:
@@ -388,7 +571,21 @@ class _AutoresearchResource:
         if filters:
             body["filters"] = filters
         resp = self._client.post(f"{self._base}/v1/autoresearch/run", json=body)
-        return _handle_response(resp)
+        data = _handle_response(resp)
+        if "job_id" in data:
+            job_id = data["job_id"]
+            max_polls = int(poll_timeout / poll_interval)
+            for _ in range(max_polls):
+                time.sleep(poll_interval)
+                poll = self._client.get(f"{self._base}/v1/autoresearch/jobs/{job_id}")
+                job = _handle_response(poll)
+                if job.get("status") == "complete" and job.get("result"):
+                    return job["result"]
+                if job.get("status") == "failed":
+                    error_msg = job.get("result", {}).get("error", "Autoresearch failed")
+                    raise OnlyMetrixError(error_msg)
+            raise OnlyMetrixError(f"Autoresearch timed out after {poll_timeout}s")
+        return data
 
 
 class _AdminResource:
@@ -447,6 +644,8 @@ class OnlyMetrix:
         self.autoresearch = _AutoresearchResource(self._client, "")
         self.admin = _AdminResource(self._client, "")
         self.custom_analyses = _CustomAnalysisApiResource(self._client, "")
+        self.server_analysis = _AnalysisResource(self._client, "")
+        self.reliability = _ReliabilityResource(self._client, "")
 
         # Lazy-init: analysis is a property so it doesn't import until used
         self._analysis = None
@@ -518,6 +717,9 @@ class AsyncOnlyMetrix:
         self.compiler = _AsyncCompilerResource(self._client, "")
         self.autoresearch = _AsyncAutoresearchResource(self._client, "")
         self.admin = _AsyncAdminResource(self._client, "")
+        self.custom_analyses = _AsyncCustomAnalysisApiResource(self._client, "")
+        self.server_analysis = _AsyncAnalysisResource(self._client, "")
+        self.reliability = _AsyncReliabilityResource(self._client, "")
 
     async def query(self, sql: str, limit: Optional[int] = None) -> QueryResult:
         """Execute a raw SQL query."""
@@ -548,6 +750,8 @@ class AsyncOnlyMetrix:
 
 
 class _AsyncMetricsResource:
+    """Async metric operations."""
+
     def __init__(self, client: httpx.AsyncClient, base_url: str):
         self._client = client
         self._base = base_url
@@ -555,6 +759,7 @@ class _AsyncMetricsResource:
     async def list(
         self, tag: Optional[str] = None, search: Optional[str] = None
     ) -> list[Metric]:
+        """List available metrics, optionally filtered by tag or search query."""
         params = {}
         if tag:
             params["tag"] = tag
@@ -570,7 +775,20 @@ class _AsyncMetricsResource:
         filters: Optional[dict[str, str]] = None,
         dimension: Optional[str] = None,
         limit: Optional[int] = None,
-    ) -> MetricResult:
+        period: Optional[str] = None,
+    ) -> "MetricResult | dict":
+        """Execute a metric by name with optional filters.
+
+        Args:
+            name: Metric name.
+            filters: Key-value filter pairs.
+            dimension: Dimension to group by.
+            limit: Row limit.
+            period: Semantic period (today, yesterday, wtd, mtd, dod, wow, mom, etc.).
+
+        Returns:
+            MetricResult for single periods, dict for comparison periods.
+        """
         body: dict[str, Any] = {}
         if filters:
             body["filters"] = filters
@@ -578,11 +796,16 @@ class _AsyncMetricsResource:
             body["dimension"] = dimension
         if limit is not None:
             body["limit"] = limit
+        if period:
+            body["period"] = period
         resp = await self._client.post(f"{self._base}/v1/metrics/{name}", json=body)
         data = _handle_response(resp)
+        if period and data.get("comparison"):
+            return data
         return MetricResult.from_dict(data)
 
     async def get(self, name: str) -> Optional[Metric]:
+        """Get a single metric by name. Returns None if not found."""
         metrics = await self.list()
         return next((m for m in metrics if m.name == name), None)
 
@@ -826,7 +1049,19 @@ class _AsyncAutoresearchResource:
         ground_truth_sql: Optional[str] = None,
         max_variations: Optional[int] = None,
         filters: Optional[dict[str, str]] = None,
+        poll_interval: float = 1.5,
+        poll_timeout: float = 300.0,
     ) -> dict:
+        """Run autoresearch on a metric asynchronously.
+
+        Args:
+            metric_name: Metric to analyze.
+            ground_truth_sql: If None, uses the metric's stored ground_truth_sql.
+            max_variations: Max variants to test.
+            filters: Segment filters.
+            poll_interval: Seconds between status polls (default 1.5).
+            poll_timeout: Max seconds to wait for completion (default 300).
+        """
         body: dict[str, Any] = {"metric_name": metric_name}
         if ground_truth_sql:
             body["ground_truth_sql"] = ground_truth_sql
@@ -835,7 +1070,20 @@ class _AsyncAutoresearchResource:
         if filters:
             body["filters"] = filters
         resp = await self._client.post(f"{self._base}/v1/autoresearch/run", json=body)
-        return _handle_response(resp)
+        data = _handle_response(resp)
+        if "job_id" in data:
+            job_id = data["job_id"]
+            max_polls = int(poll_timeout / poll_interval)
+            for _ in range(max_polls):
+                await asyncio.sleep(poll_interval)
+                poll = await self._client.get(f"{self._base}/v1/autoresearch/jobs/{job_id}")
+                job = _handle_response(poll)
+                if job.get("status") == "complete" and job.get("result"):
+                    return job["result"]
+                if job.get("status") == "failed":
+                    raise OnlyMetrixError(job.get("result", {}).get("error", "Autoresearch failed"))
+            raise OnlyMetrixError(f"Autoresearch timed out after {poll_timeout}s")
+        return data
 
 
 class _AsyncAdminResource:
@@ -857,6 +1105,111 @@ class _AsyncAdminResource:
         return _handle_response(resp)
 
 
+class _AsyncCustomAnalysisApiResource:
+    """Async server-side custom analysis DAG operations."""
+
+    def __init__(self, client: httpx.AsyncClient, base_url: str):
+        self._client = client
+        self._base = base_url
+
+    async def register(self, name: str, definition: dict, description: str = "", author: Optional[str] = None) -> dict:
+        """Register a DAG on the server."""
+        body: dict[str, Any] = {"name": name, "definition": definition, "description": description}
+        if author:
+            body["author"] = author
+        resp = await self._client.post(f"{self._base}/v1/analysis/custom", json=body)
+        return _handle_response(resp)
+
+    async def list(self) -> list[dict]:
+        """List all server-side custom analyses."""
+        resp = await self._client.get(f"{self._base}/v1/analysis/custom")
+        data = _handle_response(resp)
+        return data.get("analyses", [])
+
+    async def get(self, name: str) -> dict:
+        """Get a DAG definition by name."""
+        resp = await self._client.get(f"{self._base}/v1/analysis/custom/{name}")
+        return _handle_response(resp)
+
+    async def delete(self, name: str) -> dict:
+        """Delete a custom analysis."""
+        resp = await self._client.delete(f"{self._base}/v1/analysis/custom/{name}")
+        return _handle_response(resp)
+
+    async def run(self, name: str, metric: str, **params) -> dict:
+        """Execute a custom analysis DAG server-side."""
+        body: dict[str, Any] = {"metric": metric, "params": params}
+        resp = await self._client.post(f"{self._base}/v1/analysis/custom/{name}/run", json=body)
+        return _handle_response(resp)
+
+
+class _AsyncAnalysisResource:
+    """Async server-side analysis operations."""
+
+    def __init__(self, client: httpx.AsyncClient, base_url: str):
+        self._client = client
+        self._base = base_url
+
+    async def correlate(self, metric_a: str, metric_b: str, limit: int = 5000) -> dict:
+        """Server-side entity correlation (PII-safe)."""
+        body: dict[str, Any] = {"metric_a": metric_a, "metric_b": metric_b, "limit": limit}
+        resp = await self._client.post(f"{self._base}/v1/analysis/correlate", json=body)
+        return _handle_response(resp)
+
+
+class _AsyncReliabilityResource:
+    """Async metric reliability operations."""
+
+    def __init__(self, client: httpx.AsyncClient, base_url: str):
+        self._client = client
+        self._base = base_url
+
+    async def status(self, detail: bool = False) -> dict:
+        """Get reliability status for all metrics."""
+        params = {"detail": "true"} if detail else {}
+        resp = await self._client.get(f"{self._base}/v1/reliability/status", params=params)
+        return _handle_response(resp)
+
+    async def status_metric(self, name: str, detail: bool = False) -> dict:
+        """Get reliability status for a single metric."""
+        params = {"detail": "true"} if detail else {}
+        resp = await self._client.get(f"{self._base}/v1/reliability/status/{name}", params=params)
+        return _handle_response(resp)
+
+    async def alerts(self) -> dict:
+        """Get active reliability alerts."""
+        resp = await self._client.get(f"{self._base}/v1/reliability/alerts")
+        return _handle_response(resp)
+
+    async def affected_by(self, table: str) -> dict:
+        """Find all metrics affected by a table issue."""
+        resp = await self._client.get(f"{self._base}/v1/reliability/affected-by/{table}")
+        return _handle_response(resp)
+
+    async def subscribe(self, metric: str, channel: str, target: str) -> dict:
+        """Subscribe to be notified when a metric becomes healthy again."""
+        resp = await self._client.post(
+            f"{self._base}/v1/reliability/notify/{metric}",
+            json={"channel": channel, "target": target},
+        )
+        return _handle_response(resp)
+
+    async def configure(self, metric: str, **kwargs) -> dict:
+        """Configure reliability contract for a metric."""
+        body: dict[str, Any] = {}
+        if "freshness_sla_secs" in kwargs:
+            body["freshness_sla_secs"] = kwargs["freshness_sla_secs"]
+        if "baseline_row_count" in kwargs:
+            body["baseline_row_count"] = kwargs["baseline_row_count"]
+        if "baseline_null_rates" in kwargs:
+            body["baseline_null_rates"] = kwargs["baseline_null_rates"]
+        resp = await self._client.post(
+            f"{self._base}/v1/reliability/configure/{metric}",
+            json=body,
+        )
+        return _handle_response(resp)
+
+
 def _handle_response(resp: httpx.Response) -> dict:
     """Handle API response, raising OnlyMetrixError on failure."""
     if resp.status_code >= 400:
@@ -866,4 +1219,10 @@ def _handle_response(resp: httpx.Response) -> dict:
         except Exception:
             msg = resp.text
         raise OnlyMetrixError(msg, status_code=resp.status_code)
-    return resp.json()
+    try:
+        return resp.json()
+    except Exception:
+        raise OnlyMetrixError(
+            f"Invalid JSON in response body (status {resp.status_code})",
+            status_code=resp.status_code,
+        )

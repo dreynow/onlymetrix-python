@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onlymetrix"
-version = "0.2.0"
+version = "0.4.2"
 description = "Governed data access for AI agents. Connect to Snowflake, Postgres, or any warehouse with curated metrics, PII masking, and audit trails."
 readme = "README.md"
 license = {text = "MIT"}
@@ -15,10 +15,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-langchain = ["langchain-core>=0.2"]
-crewai = ["crewai>=0.80"]
-all = ["langchain-core>=0.2", "crewai>=0.80"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "respx>=0.21"]
+langchain = ["langchain-core>=0.2,<1.0"]
+crewai = ["crewai>=0.80,<1.0"]
+sql = ["sqlglot>=20.0"]
+all = ["langchain-core>=0.2,<1.0", "crewai>=0.80,<1.0", "sqlglot>=20.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "respx>=0.21", "sqlglot>=20.0"]
 
 [project.scripts]
 omx = "onlymetrix.cli:cli"

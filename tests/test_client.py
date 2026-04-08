@@ -170,6 +170,74 @@ class TestOnlyMetrixSync:
             om.close()
 
 
+class TestHandleResponse:
+    """Tests for _handle_response error handling."""
+
+    def test_invalid_json_response(self):
+        """_handle_response should raise OnlyMetrixError for non-JSON 200 responses."""
+        with respx.mock:
+            respx.get(f"{BASE}/healthz").respond(
+                status_code=200,
+                content=b"not json",
+                headers={"content-type": "text/plain"},
+            )
+            om = OnlyMetrix(url=BASE)
+            with pytest.raises(OnlyMetrixError) as exc_info:
+                om.health()
+            assert "Invalid JSON" in exc_info.value.message
+            om.close()
+
+    def test_error_without_json_body(self):
+        """Errors with non-JSON bodies should still produce useful messages."""
+        with respx.mock:
+            respx.get(f"{BASE}/healthz").respond(
+                status_code=502,
+                content=b"Bad Gateway",
+                headers={"content-type": "text/plain"},
+            )
+            om = OnlyMetrix(url=BASE)
+            with pytest.raises(OnlyMetrixError) as exc_info:
+                om.health()
+            assert exc_info.value.status_code == 502
+            om.close()
+
+
+class TestAsyncResourceCompleteness:
+    """Verify AsyncOnlyMetrix has all resource attributes."""
+
+    def test_async_has_custom_analyses(self):
+        om = AsyncOnlyMetrix(url=BASE)
+        assert hasattr(om, "custom_analyses")
+
+    def test_async_has_server_analysis(self):
+        om = AsyncOnlyMetrix(url=BASE)
+        assert hasattr(om, "server_analysis")
+
+    def test_async_has_reliability(self):
+        om = AsyncOnlyMetrix(url=BASE)
+        assert hasattr(om, "reliability")
+
+
+class TestQueryPeriodParam:
+    """Verify async query supports period parameter."""
+
+    def test_sync_query_with_period(self):
+        with respx.mock:
+            respx.post(f"{BASE}/v1/metrics/revenue").respond(json={
+                "metric": "revenue",
+                "comparison": True,
+                "current": {"value": 100},
+                "previous": {"value": 90},
+                "change_pct": 11.1,
+                "direction": "up",
+            })
+            om = OnlyMetrix(url=BASE)
+            result = om.metrics.query("revenue", period="mom")
+            assert isinstance(result, dict)
+            assert result["comparison"] is True
+            om.close()
+
+
 @pytest.mark.asyncio
 class TestOnlyMetrixAsync:
     async def test_health(self):
@@ -202,3 +270,44 @@ class TestOnlyMetrixAsync:
             async with AsyncOnlyMetrix(url=BASE) as om:
                 result = await om.metrics.query("revenue")
                 assert result.rows[0]["total"] == 99.9
+
+    async def test_query_metric_with_period(self):
+        async with respx.mock:
+            respx.post(f"{BASE}/v1/metrics/revenue").respond(json={
+                "metric": "revenue",
+                "comparison": True,
+                "current": {"value": 100},
+                "previous": {"value": 90},
+            })
+            async with AsyncOnlyMetrix(url=BASE) as om:
+                result = await om.metrics.query("revenue", period="wow")
+                assert isinstance(result, dict)
+                assert result["comparison"] is True
+
+    async def test_async_custom_analyses_list(self):
+        async with respx.mock:
+            respx.get(f"{BASE}/v1/analysis/custom").respond(json={
+                "analyses": [{"name": "test_dag", "description": "A test"}]
+            })
+            async with AsyncOnlyMetrix(url=BASE) as om:
+                result = await om.custom_analyses.list()
+                assert len(result) == 1
+                assert result[0]["name"] == "test_dag"
+
+    async def test_async_server_analysis_correlate(self):
+        async with respx.mock:
+            respx.post(f"{BASE}/v1/analysis/correlate").respond(json={
+                "jaccard": 0.42, "overlap_count": 100
+            })
+            async with AsyncOnlyMetrix(url=BASE) as om:
+                result = await om.server_analysis.correlate("metric_a", "metric_b")
+                assert result["jaccard"] == 0.42
+
+    async def test_async_reliability_status(self):
+        async with respx.mock:
+            respx.get(f"{BASE}/v1/reliability/status").respond(json={
+                "metrics": [{"name": "revenue", "status": "healthy"}]
+            })
+            async with AsyncOnlyMetrix(url=BASE) as om:
+                result = await om.reliability.status()
+                assert "metrics" in result

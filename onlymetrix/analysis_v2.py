@@ -101,11 +101,15 @@ def correlate(
     metric_b: str,
     limit: int = 5000,
     auto_health: bool = True,
+    server_side: bool = True,
 ) -> dict:
     """Correlate two entity metrics by shared entity keys.
 
     Both metrics must return rows with entity IDs (customer_ref, id).
     Computes overlap, Jaccard similarity, and directional relationship.
+
+    When server_side=True (default), uses the server-side correlate endpoint
+    which operates on unmasked data — solving PII masking issues.
 
     Agent use: "Do high-value customers churn more?"
     """
@@ -119,7 +123,21 @@ def correlate(
         warnings.extend([f"{metric_a}: {w}" for w in h_a.get("warnings", [])])
         warnings.extend([f"{metric_b}: {w}" for w in h_b.get("warnings", [])])
 
-    # Query both metrics to get entity sets
+    # Prefer server-side correlation (operates on unmasked data)
+    if server_side and hasattr(om, "server_analysis"):
+        try:
+            result = om.server_analysis.correlate(metric_a, metric_b, limit=limit)
+            # Merge in health status and any client-side warnings
+            if health_status:
+                result["metric_health"] = health_status
+            if warnings:
+                result.setdefault("warnings", []).extend(warnings)
+            return result
+        except Exception as e:
+            warnings.append(f"Server-side correlation failed ({e}), falling back to client-side (PII masked)")
+            # Fall through to client-side correlation
+
+    # Client-side fallback: queries go through PII masking
     try:
         result_a = om.metrics.query(metric_a, limit=limit)
         result_b = om.metrics.query(metric_b, limit=limit)
