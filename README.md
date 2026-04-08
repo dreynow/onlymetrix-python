@@ -1,9 +1,32 @@
 # OnlyMetrix Python SDK
 
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
+[![Version](https://img.shields.io/badge/version-0.4.2-green.svg)](CHANGELOG.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Python client and CLI for [OnlyMetrix](https://onlymetrix.com) — a governed metric layer for AI agents and data teams.
+
+---
+
+## Installation
 
 ```bash
 pip install onlymetrix
+```
+
+**From Google Colab / Jupyter:**
+
+```python
+!pip install "git+https://github.com/dreynow/onlymetrix-python.git"
+```
+
+**Optional extras:**
+
+```bash
+pip install onlymetrix[sql]             # SQL-to-Semantic-Layer converter
+pip install onlymetrix[langchain]       # LangChain tool bindings
+pip install onlymetrix[crewai]          # CrewAI tool bindings
+pip install onlymetrix[all]             # everything
 ```
 
 Requires Python 3.9+. See [CHANGELOG](CHANGELOG.md) for version history.
@@ -18,6 +41,7 @@ The SDK gives you:
 
 - **Python client** — query metrics, run structured analysis, manage setup
 - **CLI** (`omx`) — everything the client does, plus CI-friendly commands
+- **SQL converter** — turn raw SQL into governed metric definitions
 - **dbt integration** — sync MetricFlow metrics from dbt into OnlyMetrix
 - **MetricFlow export** — compile the OM IR back to dbt-compatible YAML
 - **Agent integrations** — LangChain and CrewAI tool bindings
@@ -50,33 +74,236 @@ Environment variables: `OMX_API_URL` (default `http://localhost:8080`), `OMX_API
 
 ## SQL-to-Semantic-Layer converter
 
-Convert raw SQL queries into governed metric definitions — no manual YAML writing.
+Convert raw SQL queries into governed metric definitions — no manual YAML writing. The converter parses SQL to extract aggregations, source tables, filters, dimensions, and time columns.
+
+### Basic usage
 
 ```python
-from onlymetrix import convert_sql
+from onlymetrix.sql_converter import convert_sql, extract_sql
+import json
 
 metric = convert_sql(
-    "SELECT SUM(amount) FROM orders WHERE status = 'paid' AND created_at >= '2025-01-01'",
+    "SELECT SUM(amount) FROM orders WHERE status = 'paid'",
     name="total_revenue",
-    description="Total paid revenue in USD",
+    description="Total paid revenue",
 )
-# → {"name": "total_revenue", "sql": "...", "source_tables": ["orders"],
-#    "tags": ["finance", "aggregate"], "time_column": "created_at",
-#    "filters": [{"name": "status", "type": "string"}, ...]}
 
-om.setup.import_metrics([metric])
+# Pretty-print the metric dict
+print(json.dumps(metric, indent=2))
 ```
 
-Batch convert a directory of `.sql` files:
+Output:
 
-```bash
-omx sql convert-batch ./queries/ --format yaml --output metrics.yaml
-omx sql convert-batch ./queries/ --import   # convert + push to server
+```json
+{
+  "name": "total_revenue",
+  "description": "Total paid revenue",
+  "sql": "SELECT SUM(amount) FROM orders WHERE status = 'paid'",
+  "source_tables": ["orders"],
+  "tags": ["aggregate", "finance"],
+  "filters": [{"name": "status", "type": "string"}]
+}
 ```
 
-Inspect what gets extracted before importing:
+### YAML output with `extract_sql`
+
+Use `extract_sql` for full metadata extraction — returns an `ExtractedMetric` dataclass with aggregations, dimensions, warnings, and a `.to_yaml()` method:
+
+```python
+from onlymetrix.sql_converter import extract_sql
+
+metric = extract_sql(
+    "SELECT SUM(amount) FROM orders WHERE status = 'paid'",
+    name="total_revenue",
+    description="Total paid revenue",
+)
+
+print(metric.to_yaml())
+```
+
+Output:
+
+```yaml
+- name: total_revenue
+  description: Total paid revenue
+  sql: |
+    SELECT SUM(amount) FROM orders WHERE status = 'paid'
+  source_tables: [orders]
+  tags: [aggregate, finance]
+  filters:
+    - name: status
+      type: string
+```
+
+### SQL with JOINs
+
+The converter handles multi-table joins, extracting all source tables, dimensions, and time columns:
+
+**Revenue by customer segment:**
+
+```python
+metric = extract_sql(
+    """SELECT SUM(o.amount)
+       FROM orders o
+       JOIN customers c ON o.customer_id = c.id
+       WHERE c.segment = 'enterprise'""",
+    name="enterprise_revenue",
+    description="Total revenue from enterprise customers",
+)
+print(metric.to_yaml())
+```
+
+```yaml
+- name: enterprise_revenue
+  description: Total revenue from enterprise customers
+  sql: |
+    SELECT SUM(o.amount)
+       FROM orders o
+       JOIN customers c ON o.customer_id = c.id
+       WHERE c.segment = 'enterprise'
+  source_tables: [orders, customers]
+  tags: [aggregate, customers, finance]
+  filters:
+    - name: c.segment
+      type: string
+```
+
+**Average order value by product category:**
+
+```python
+metric = extract_sql(
+    """SELECT AVG(o.amount)
+       FROM orders o
+       JOIN order_items oi ON o.id = oi.order_id
+       JOIN products p ON oi.product_id = p.id
+       GROUP BY p.category""",
+    name="avg_order_by_category",
+    description="Average order value broken down by product category",
+)
+print(metric.to_yaml())
+```
+
+**Distinct active users with events:**
+
+```python
+metric = extract_sql(
+    """SELECT COUNT(DISTINCT u.id)
+       FROM users u
+       JOIN events e ON u.id = e.user_id
+       WHERE e.event_date >= '2024-01-01'
+         AND u.status = 'active'""",
+    name="active_users_with_events",
+    description="Distinct active users who triggered at least one event",
+)
+print(metric.to_yaml())
+```
+
+```yaml
+- name: active_users_with_events
+  description: Distinct active users who triggered at least one event
+  sql: |
+    SELECT COUNT(DISTINCT u.id)
+       FROM users u
+       JOIN events e ON u.id = e.user_id
+       WHERE e.event_date >= '2024-01-01'
+         AND u.status = 'active'
+  source_tables: [users, events]
+  tags: [cardinality, customers, engagement]
+  time_column: event_date
+  filters:
+    - name: e.event_date
+      type: number
+    - name: u.status
+      type: string
+```
+
+**Net payments excluding refunds:**
+
+```python
+metric = extract_sql(
+    """SELECT SUM(p.amount)
+       FROM payments p
+       JOIN invoices i ON p.invoice_id = i.id
+       JOIN customers c ON i.customer_id = c.id
+       WHERE p.status = 'completed'
+         AND p.refunded = false""",
+    name="net_payments",
+    description="Total completed payments excluding refunds",
+)
+print(metric.to_yaml())
+```
+
+**Pro-tier session count:**
+
+```python
+metric = extract_sql(
+    """SELECT COUNT(s.id)
+       FROM sessions s
+       JOIN accounts a ON s.account_id = a.id
+       JOIN plans pl ON a.plan_id = pl.id
+       WHERE pl.tier = 'pro'
+       GROUP BY a.name, s.created_at""",
+    name="pro_session_count",
+    description="Session count for pro-tier accounts by month",
+)
+print(metric.to_yaml())
+```
+
+### Accessing extracted fields
+
+```python
+from dataclasses import asdict
+
+metric = extract_sql(...)
+
+# Direct field access
+print(f"Name:        {metric.name}")
+print(f"Tables:      {metric.source_tables}")
+print(f"Aggregation: {metric.aggregations}")
+print(f"Filters:     {metric.filters}")
+print(f"Dimensions:  {metric.dimensions}")
+print(f"Time column: {metric.time_column}")
+print(f"Tags:        {metric.tags}")
+print(f"Warnings:    {metric.warnings}")
+
+# Full dict (all fields)
+print(json.dumps(asdict(metric), indent=2))
+```
+
+### Batch conversion
+
+```python
+from onlymetrix.sql_converter import convert_sql_batch
+
+metrics = convert_sql_batch([
+    {"sql": "SELECT SUM(amount) FROM orders", "name": "total_orders"},
+    {"sql": "SELECT COUNT(DISTINCT user_id) FROM sessions", "name": "unique_users"},
+    {"sql": "SELECT AVG(score) FROM reviews WHERE rating >= 4", "name": "avg_positive_score"},
+])
+
+# Import all at once
+om.setup.import_metrics(metrics)
+```
+
+### File and directory conversion
+
+```python
+from onlymetrix.sql_converter import convert_sql_file, convert_sql_directory
+
+# Single file (metric name defaults to filename)
+metric = convert_sql_file("queries/total_revenue.sql")
+
+# All .sql files in a directory
+metrics = convert_sql_directory("queries/")
+```
+
+### CLI
 
 ```bash
+# Convert a single query
+omx sql convert "SELECT SUM(amount) FROM orders" --name total_revenue
+
+# Inspect extraction details before importing
 omx sql inspect "SELECT country, SUM(amount) FROM orders GROUP BY country"
 #   Name:         sum_amount
 #   Tables:       orders
@@ -85,9 +312,11 @@ omx sql inspect "SELECT country, SUM(amount) FROM orders GROUP BY country"
 #   Dimensions:   country
 #   Time column:  (not detected)
 #   Tags:         aggregate, finance
-```
 
-Install with SQL support: `pip install onlymetrix[sql]`
+# Batch convert a directory
+omx sql convert-batch ./queries/ --format yaml --output metrics.yaml
+omx sql convert-batch ./queries/ --import   # convert + push to server
+```
 
 ---
 
@@ -173,8 +402,6 @@ omx validate --format metricflow --strict
 omx export --format metricflow --output models/marts/om_generated_metrics.yml
 dbt compile   # verify the generated YAML is valid MetricFlow
 ```
-
-See `tutorials/dbt-metricflow-export/` for a runnable end-to-end example against a live ClickHouse warehouse.
 
 ---
 
@@ -301,6 +528,11 @@ omx metrics delete churn_risk
 omx tables list
 omx tables describe customers
 
+# SQL converter
+omx sql convert "SELECT SUM(amount) FROM orders" --name total_revenue
+omx sql convert-batch ./queries/ [--format yaml] [--output metrics.yaml] [--import]
+omx sql inspect "SELECT ..."
+
 # dbt integration
 omx dbt connect [--profiles-dir .] [--dry-run]
 omx dbt sync [--manifest path/to/manifest.json] [--dry-run] [--strict]
@@ -358,16 +590,51 @@ except OnlyMetrixError as e:
 
 ---
 
-## Installation
+## Google Colab quickstart
 
-```bash
-pip install onlymetrix                  # core
-pip install onlymetrix[langchain]       # + LangChain tools
-pip install onlymetrix[crewai]          # + CrewAI tools
-pip install onlymetrix[all]             # everything
+```python
+# Cell 1 — Install
+!pip install "git+https://github.com/dreynow/onlymetrix-python.git"
+
+# Cell 2 — Verify install
+import onlymetrix
+print(f"OnlyMetrix SDK v{onlymetrix.__version__}")
+
+# Cell 3 — SQL converter (works without an API key)
+from onlymetrix.sql_converter import extract_sql
+import json
+
+metric = extract_sql(
+    """SELECT COUNT(DISTINCT u.id)
+       FROM users u
+       JOIN events e ON u.id = e.user_id
+       WHERE e.event_date >= '2024-01-01'
+         AND u.status = 'active'""",
+    name="active_users_with_events",
+    description="Distinct active users who triggered at least one event",
+)
+
+# Pretty JSON
+print(json.dumps(json.loads(json.dumps(
+    {k: v for k, v in metric.__dict__.items()}
+)), indent=2))
+
+# YAML output
+print(metric.to_yaml())
+
+# Cell 4 — Connect and query (requires API key)
+from onlymetrix import OnlyMetrix
+
+om = OnlyMetrix("https://api.onlymetrix.com", api_key="omx_sk_...")
+result = om.metrics.query("total_revenue", filters={"time_start": "2025-01-01"})
+print(result.rows)
 ```
 
 ---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 
