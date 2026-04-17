@@ -1658,5 +1658,18 @@ def sql_inspect(ctx, sql_input, name):
             click.echo(f"    ! {w}")
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point shim.
+
+    Rust-owned subcommands (ci/dbt/discover/scaffold) are dispatched to the
+    `omx` binary via rust_bridge before click enters. Everything else
+    passes through to the click group below.
+    """
+    from onlymetrix.rust_bridge import maybe_dispatch_to_rust
+
+    maybe_dispatch_to_rust(sys.argv)
     cli()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.6.0
+
+### New features
+- `omx ci check` — dbt manifest vs IR baseline diff for CI/CD. Detects breaking
+  column changes (drops, possible renames), enforces metric tier severity
+  (core/critical blocks, standard warns, foundation is info-only), and lists
+  affected canvas dashboards plus a decisions-at-risk touchpoint.
+- `omx ci snapshot` — write `.omx/ir.lock.json` for repos that commit their
+  baseline instead of hitting the API at CI time.
+- `omx dbt sync` — push a dbt manifest to the OM catalog (moved from Rust CLI
+  into the unified `omx` surface).
+- Rust binary ships as a GitHub Release asset and is fetched lazily on first
+  use of a Rust-owned subcommand. Set `OMX_BINARY=/path/to/omx` to skip the
+  download (dev loops, pre-seeded CI caches).
+- Platforms supported at launch: linux-x64. macos-x64 / macos-arm64 /
+  linux-arm64 coming in follow-up releases.
+
+### Internal
+- New `onlymetrix.rust_bridge` module handles platform detection, binary cache
+  (`~/.cache/onlymetrix/omx-<version>`), and dispatch.
+- CLI entry point changed from `onlymetrix.cli:cli` to `onlymetrix.cli:main`
+  so Rust subcommands can intercept before click parses.
+
 ## v0.4.2
 
 ### Bug fixes
