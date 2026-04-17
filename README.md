@@ -1,7 +1,7 @@
 # OnlyMetrix Python SDK
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-0.4.2-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.6.0-green.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Python client and CLI for [OnlyMetrix](https://onlymetrix.com) — a governed metric layer for AI agents and data teams.
@@ -402,6 +402,24 @@ omx validate --format metricflow --strict
 omx export --format metricflow --output models/marts/om_generated_metrics.yml
 dbt compile   # verify the generated YAML is valid MetricFlow
 ```
+
+### CI/CD for pull requests (v0.6.0+)
+
+Catch breaking metric changes before they merge:
+
+```bash
+omx ci snapshot                                              # pin current IR baseline (once)
+omx ci check --manifest ./target/manifest.json --strict      # runs in CI on every PR
+```
+
+Detects dropped columns, probable renames, and flags impact by metric tier
+(`core` blocks the PR, `standard` warns, `foundation` is info-only). Posts a
+PR comment showing affected dashboards and — on OnlyMetrix cloud — which
+business decisions referenced the metric.
+
+Full walkthrough with the GitHub Actions workflow: [dbt CI/CD docs][ci-docs].
+
+[ci-docs]: https://onlymetrix.com/docs/integrations/dbt.html#ci-cd-for-pull-requests
 
 ---
 
