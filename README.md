@@ -72,6 +72,57 @@ Environment variables: `OMX_API_URL` (default `http://localhost:8080`), `OMX_API
 
 ---
 
+## dbt integration — compile metrics locally
+
+If you run dbt, `omx dbt sync` reads your `target/manifest.json` and compiles a governed metric IR to `.omx/ir.json` — **no OnlyMetrix account required**. MetricFlow metrics are extracted in Python; the bundled Rust engine walks each model's SQL and proposes metrics from aliased aggregates (`SUM`, `AVG`, `COUNT`, `COUNT DISTINCT`, `MIN`, `MAX`).
+
+```bash
+pip install onlymetrix
+dbt parse                        # produces target/manifest.json
+omx dbt sync --project-dir .     # writes .omx/ir.json
+```
+
+Sample run against a fresh `git clone https://github.com/dbt-labs/jaffle_shop`:
+
+```
+[ok] IR compiled locally — 4 metrics
+Written to: .omx/ir.json
+
+  first_order        standard  MIN(FIRST_ORDER)
+  most_recent_order  standard  MAX(MOST_RECENT_ORDER)
+  number_of_orders   standard  COUNT(NUMBER_OF_ORDERS)
+  total_amount       core      SUM(TOTAL_AMOUNT)
+```
+
+### Override tier in schema.yml
+
+The compiler classifies each inferred metric into `core`, `standard`, or `foundation` by heuristic. Override on a per-model basis:
+
+```yaml
+models:
+  - name: orders
+    meta:
+      onlymetrix:
+        tier: core               # core | standard | foundation
+        label: "Orders"          # optional display label
+```
+
+Every metric inferred from that model takes the declared tier; `tier_source` in `ir.json` will read `meta.onlymetrix.tier` so downstream tools can distinguish explicit overrides from inferred assignments.
+
+### Cloud sync (optional)
+
+Set `OMX_API_KEY` to additionally push the compiled manifest to your OnlyMetrix workspace for reliability scoring, canvas dashboards, and team sharing:
+
+```bash
+OMX_API_URL=https://api.onlymetrix.com \
+OMX_API_KEY=omx_sk_... \
+  omx dbt sync --project-dir .
+```
+
+The local `.omx/ir.json` is still written. Cloud sync is additive, never required.
+
+---
+
 ## SQL-to-Semantic-Layer converter
 
 Convert raw SQL queries into governed metric definitions — no manual YAML writing. The converter parses SQL to extract aggregations, source tables, filters, dimensions, and time columns.

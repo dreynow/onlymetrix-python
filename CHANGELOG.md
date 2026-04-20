@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.6.5
+
+### New features
+- `meta.onlymetrix.tier` on a dbt model now overrides the compiler's
+  heuristic tier assignment for every metric inferred from that model:
+
+  ```yaml
+  models:
+    - name: orders
+      meta:
+        onlymetrix:
+          tier: core        # core | standard | foundation
+          label: "Orders"   # optional display label
+  ```
+
+  Metrics inferred from `orders` — regardless of whether they come
+  from MetricFlow or raw-SQL parsing — will be tagged with the chosen
+  tier. The heuristic classifier still runs as a fallback when no
+  override is present.
+
 ## v0.6.4
 
 ### New features
