@@ -3,7 +3,7 @@ from onlymetrix.models import Metric, MetricResult, MetricRequest, QueryResult, 
 from onlymetrix.analysis import Analysis
 from onlymetrix.sql_converter import convert_sql, convert_sql_batch, extract_sql
 
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 __all__ = [
     "OnlyMetrix",
     "AsyncOnlyMetrix",

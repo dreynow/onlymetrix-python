@@ -1291,16 +1291,15 @@ def _print_compile_summary(
         click.echo(f"  {name.ljust(name_w)}{tier.ljust(tier_w)}{summary}")
 
     click.echo()
-    click.echo("Query interface ready:")
-    click.echo("  omx metrics list")
-    if metrics_list:
-        first = metrics_list[0]["name"]
-        click.echo(f"  omx query --metric {first}")
     if cloud_synced:
-        click.echo("\nReliability scores -> app.onlymetrix.com")
+        click.echo("Reliability scores -> app.onlymetrix.com")
     else:
-        click.echo("\nFor reliability scores and team features:")
+        click.echo("Inspect the compiled IR:")
+        click.echo(f"  cat {out_path}")
+        click.echo()
+        click.echo("To query metrics against your warehouse:")
         click.echo("  Sign up free at app.onlymetrix.com")
+        click.echo("  (omx query + omx metrics list require a warehouse connection)")
 
 
 # ── Reliability ──────────────────────────────────────────────────────

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.3
+
+### Changed
+- `omx dbt sync` footer now only shows commands that actually work in
+  the local free-tier flow: `cat .omx/ir.json` for inspection, plus the
+  app.onlymetrix.com signup link for the cloud-only commands. The
+  previous `omx metrics list` / `omx query --metric X` hints errored
+  with `Connection refused` on a fresh install.
+
 ## v0.6.2
 
 ### New features
