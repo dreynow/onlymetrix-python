@@ -40,15 +40,21 @@ URL_TEMPLATE = (
 RUST_SUBCOMMANDS = {"ci", "dbt", "discover", "scaffold"}
 
 
+IS_WINDOWS = platform.system().lower() == "windows"
+BINARY_NAME = "omx.exe" if IS_WINDOWS else "omx"
+
+
 def _platform_tag() -> str:
     system = platform.system().lower()
     machine = platform.machine().lower()
     if system == "linux" and machine in ("x86_64", "amd64"):
         return "linux-x64"
-    if system == "darwin" and machine in ("x86_64", "amd64"):
-        return "macos-x64"
+    if system == "linux" and machine in ("aarch64", "arm64"):
+        return "linux-arm64"
     if system == "darwin" and machine in ("arm64", "aarch64"):
         return "macos-arm64"
+    if system == "windows" and machine in ("amd64", "x86_64"):
+        return "windows-x64"
     raise RuntimeError(
         f"onlymetrix: no Rust binary published for {system}/{machine} yet. "
         "Set OMX_BINARY to a locally built `omx` to unblock."
@@ -63,7 +69,8 @@ def _cache_dir() -> Path:
 
 
 def _cached_binary_path() -> Path:
-    return _cache_dir() / f"omx-{__version__}"
+    suffix = ".exe" if IS_WINDOWS else ""
+    return _cache_dir() / f"omx-{__version__}{suffix}"
 
 
 def _download_binary(plat: str, dest: Path) -> None:
@@ -75,12 +82,20 @@ def _download_binary(plat: str, dest: Path) -> None:
     try:
         urllib.request.urlretrieve(url, tarball)
         with tarfile.open(tarball) as t:
-            members = [m for m in t.getmembers() if m.name == "omx" or m.name.endswith("/omx")]
+            members = [
+                m for m in t.getmembers()
+                if m.name == BINARY_NAME or m.name.endswith(f"/{BINARY_NAME}")
+            ]
             if not members:
-                raise RuntimeError(f"omx binary not found in tarball from {url}")
+                raise RuntimeError(
+                    f"{BINARY_NAME} not found in tarball from {url}"
+                )
             with t.extractfile(members[0]) as src, open(dest, "wb") as out:
                 shutil.copyfileobj(src, out)
-        dest.chmod(dest.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        if not IS_WINDOWS:
+            dest.chmod(
+                dest.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+            )
     finally:
         tarball.unlink(missing_ok=True)
 

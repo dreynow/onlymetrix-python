@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.6.1
+
+### New features
+- Rust `omx` binary now ships for **linux-x64, linux-arm64, macos-arm64,
+  windows-x64**. Apple Silicon Macs, arm64 Linux (Graviton, GH Actions
+  arm runners, Raspberry Pi), and Windows laptops all work without
+  setting `OMX_BINARY`.
+
+### Internal
+- `rust_bridge.py` learns Windows (`omx.exe` handling, no `chmod +x`),
+  linux-arm64, and drops the never-shipped macos-x64 branch.
+- Release pipeline builds all four targets on tag push via GitHub
+  Actions matrix in the private `dreynow/onlymetrix` repo, which
+  uploads tarballs to this repo's release.
+
 ## v0.6.0
 
 ### New features
