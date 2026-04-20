@@ -371,7 +371,9 @@ omx sql convert-batch ./queries/ --import   # convert + push to server
 
 ---
 
-## dbt integration
+## dbt integration — cloud sync, validate, export
+
+The local-compile flow above writes `.omx/ir.json` on your laptop with no cloud account. The commands below cover the additional cloud-connected workflow: register a warehouse with OnlyMetrix, sync metrics server-side, validate against MetricFlow, and export OM IR back to dbt YAML.
 
 ### 1. Connect your warehouse
 
@@ -385,10 +387,10 @@ omx dbt connect --dry-run          # preview without calling the API
 
 ### 2. Sync metrics
 
-Reads `target/manifest.json` (produced by `dbt compile`), translates MetricFlow definitions to SQL, and pushes them to the OM compiler.
+Reads `target/manifest.json` (produced by `dbt parse` — no warehouse needed — or `dbt compile` when you want resolved `{{ ref() }}` macros), translates MetricFlow definitions to SQL, and pushes them to the OM compiler.
 
 ```bash
-dbt compile
+dbt parse
 omx dbt sync
 omx dbt sync --dry-run             # preview what would sync
 omx dbt sync --strict              # exit non-zero if any metric is opaque or failed
