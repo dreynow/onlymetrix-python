@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 import click
@@ -1073,8 +1075,8 @@ def dbt_connect(
 @dbt.command("sync")
 @click.option("--manifest", default=None, type=click.Path(), help="Path to manifest.json")
 @click.option("--project-dir", default=None, type=click.Path(), help="dbt project directory")
-@click.option("--dry-run", is_flag=True, default=False, help="Preview sync without calling API")
-@click.option("--strict", is_flag=True, default=False, help="Exit non-zero if any metric is opaque or failed")
+@click.option("--out", "out_path", default=".omx/ir.json", type=click.Path(), help="Where to write the compiled IR")
+@click.option("--strict", is_flag=True, default=False, help="Exit non-zero if any metric is opaque")
 @click.option("--url", default=None, help="OnlyMetrix API URL (overrides OMX_API_URL)")
 @click.option("--api-key", default=None, help="OnlyMetrix API key (overrides OMX_API_KEY)")
 @click.pass_context
@@ -1082,124 +1084,223 @@ def dbt_sync(
     ctx: click.Context,
     manifest: str | None,
     project_dir: str | None,
-    dry_run: bool,
+    out_path: str,
     strict: bool,
     url: str | None,
     api_key: str | None,
 ) -> None:
-    """Sync dbt metrics to OnlyMetrix.
+    """Compile dbt metrics into an OM IR (local, no account needed).
 
-    Reads target/manifest.json, extracts metric definitions, translates
-    MetricFlow types to SQL, and syncs to the OM API.
+    Reads target/manifest.json, extracts any MetricFlow / legacy dbt metrics
+    directly in Python, and shells out to the bundled Rust `omx dbt compile`
+    for inferred metrics on non-metric models. Writes the merged IR to
+    .omx/ir.json. If OMX_API_KEY is set, additionally pushes to the cloud
+    for reliability scoring, canvas and team features.
 
     \b
     Usage:
-      dbt run
-      omx dbt sync              # sync to OM
-      omx dbt sync --dry-run    # preview without syncing
+      dbt parse                        # produce target/manifest.json
+      omx dbt sync --project-dir .     # compile IR locally (free)
+      OMX_API_KEY=... omx dbt sync ... # also sync to cloud
     """
-    from onlymetrix.dbt import (
-        find_manifest,
-        parse_manifest,
-        compute_sync_plan,
-        format_dry_run,
-        load_sync_state,
-        save_sync_state,
-    )
+    from onlymetrix.dbt import find_manifest, parse_manifest
+    from onlymetrix.rust_bridge import resolve_binary
 
-    # 1. Find manifest
+    # 1. Locate manifest
     try:
         manifest_path = find_manifest(manifest, project_dir)
     except FileNotFoundError as e:
         click.echo(str(e), err=True)
         sys.exit(1)
 
-    target_dir = manifest_path.parent
     click.echo(f"Reading {manifest_path}")
 
-    # 2. Parse metrics
+    # 2. Python-side parse: MetricFlow + legacy dbt metric nodes.
+    # These are user-authored metrics, so they take precedence over any
+    # inferred candidate with the same name.
     try:
-        metrics = parse_manifest(manifest_path)
+        mf_metrics = parse_manifest(manifest_path)
     except Exception as e:
         click.echo(f"Failed to parse manifest: {e}", err=True)
         sys.exit(1)
 
-    if not metrics:
-        click.echo("No metrics found in manifest.")
-        return
-
-    # 3. Compute sync plan
-    prev_state = load_sync_state(target_dir)
-    actions = compute_sync_plan(metrics, prev_state)
-
-    # 4. Dry-run: print and exit
-    if dry_run:
-        click.echo(format_dry_run(actions))
-        if strict:
-            opaque_or_failed = [a for a in actions if a.metric.compile_hint in ("opaque", "failed")]
-            if opaque_or_failed:
-                click.echo(f"\n--strict: {len(opaque_or_failed)} metric(s) are not structured", err=True)
-                sys.exit(1)
-        return
-
-    # 5. Live sync
-    to_sync = [a for a in actions if a.action in ("create", "update")]
-    if not to_sync:
-        click.echo(f"All {len(actions)} metrics unchanged. Nothing to sync.")
-        return
-
-    # Override client config if provided
-    if url:
-        os.environ["OMX_API_URL"] = url
-    if api_key:
-        os.environ["OMX_API_KEY"] = api_key
-
-    payloads = [a.metric.to_api_payload() for a in to_sync]
+    # 3. Rust-side compile: heuristic inference from non-metric models.
+    # The binary ships with the package via rust_bridge; it runs entirely
+    # on the user's machine with no HTTP or DB dependency.
+    import subprocess
+    import tempfile
 
     try:
-        with _get_client() as om:
-            resp = om._client.post(
-                "/v1/metrics/sync-dbt",
-                json={"metrics": payloads},
+        binary = resolve_binary()
+    except RuntimeError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+        tmp_out = Path(tf.name)
+    try:
+        result = subprocess.run(
+            [
+                str(binary), "dbt", "compile",
+                "--manifest", str(manifest_path),
+                "--out", str(tmp_out),
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            click.echo(
+                f"Local compile failed (omx dbt compile): {result.stderr.strip()}",
+                err=True,
             )
-            if resp.status_code >= 400:
-                try:
-                    error_body = resp.json()
-                except Exception:
-                    error_body = {"error": resp.text}
-                click.echo(json.dumps({"error": error_body, "status": resp.status_code}), err=True)
-                sys.exit(1)
-            result = resp.json()
-    except Exception as e:
-        click.echo(f"Sync failed: {e}", err=True)
-        sys.exit(1)
+            sys.exit(1)
+        inferred_ir = json.loads(tmp_out.read_text())
+    finally:
+        tmp_out.unlink(missing_ok=True)
 
-    # 6. Save sync state
-    new_state = {m.name: m.hash_key() for m in metrics}
-    save_sync_state(target_dir, new_state)
+    # 4. Merge. MetricFlow wins on name collision — the user wrote those
+    # deliberately, the inference engine is guessing.
+    merged: dict[str, dict] = {}
+    for item in inferred_ir.get("metrics", []):
+        merged[item["name"]] = item
+    for m in mf_metrics:
+        merged[m.name] = _metricflow_to_ir_entry(m)
 
-    # 7. Report results
-    synced = result.get("synced", 0)
-    created = result.get("created", 0)
-    updated = result.get("updated", 0)
-    compile_results = result.get("compile_results", {})
-    structured = compile_results.get("structured", 0)
-    opaque = compile_results.get("opaque", 0)
-    failed = compile_results.get("failed", 0)
-    tier_updates = result.get("tier_updates", 0)
+    metrics_list = list(merged.values())
 
-    click.echo(f"\nSynced {synced} metrics ({created} created, {updated} updated)")
-    click.echo(f"Compile: {structured} structured, {opaque} opaque, {failed} failed")
-    if tier_updates:
-        click.echo(f"Tier updates: {tier_updates}")
+    # 5. Write .omx/ir.json
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    ir_doc = {
+        "total": len(metrics_list),
+        "metrics": metrics_list,
+        "source": {
+            "manifest": str(manifest_path),
+            "metricflow_count": len(mf_metrics),
+            "inferred_count": len(inferred_ir.get("metrics", [])),
+        },
+    }
+    out.write_text(json.dumps(ir_doc, indent=2))
 
-    unchanged_count = len(actions) - len(to_sync)
-    if unchanged_count:
-        click.echo(f"Skipped: {unchanged_count} unchanged")
+    # 6. Optional cloud sync. Presence of a key (env or flag) is the
+    # free/paid toggle — no feature flag, no separate command. Delegates
+    # to the Rust binary's existing dbt-sync POST to avoid re-implementing
+    # HTTP semantics in Python.
+    resolved_key = api_key or os.environ.get("OMX_API_KEY")
+    cloud_synced = False
+    cloud_workspace_url: str | None = None
+    if resolved_key:
+        rust_env = os.environ.copy()
+        if url:
+            rust_env["OMX_API_URL"] = url
+        if api_key:
+            rust_env["OMX_API_KEY"] = api_key
+        cloud = subprocess.run(
+            [str(binary), "dbt", "sync", str(manifest_path)],
+            capture_output=True, text=True, env=rust_env,
+        )
+        if cloud.returncode != 0:
+            click.echo(
+                f"Cloud sync failed: {cloud.stderr.strip() or cloud.stdout.strip()}",
+                err=True,
+            )
+        else:
+            cloud_synced = True
+            cloud_workspace_url = rust_env.get("OMX_API_URL")
 
-    if strict and (opaque > 0 or failed > 0):
-        click.echo(f"\n--strict: {opaque + failed} metric(s) are not structured", err=True)
-        sys.exit(1)
+    # 7. Pretty output
+    _print_compile_summary(
+        metrics_list,
+        out_path=str(out),
+        cloud_synced=cloud_synced,
+        cloud_workspace_url=cloud_workspace_url,
+    )
+
+    if strict:
+        opaque = [m for m in metrics_list if m.get("tier") == "opaque" or m.get("compile_hint") == "opaque"]
+        if opaque:
+            click.echo(f"\n--strict: {len(opaque)} opaque metric(s)", err=True)
+            sys.exit(1)
+
+
+def _metricflow_to_ir_entry(m) -> dict:
+    """Shape a ParsedMetric (MetricFlow/legacy) to match Rust's IR entry format."""
+    # MetricFlow metrics are user-authored, so they default to "core" tier
+    # unless schema.yml meta.onlymetrix.tier overrides.
+    tier = (m.omx_meta.tier if m.omx_meta and m.omx_meta.tier else "core")
+    return {
+        "name": m.name,
+        "label": m.name.replace("_", " ").title(),
+        "sql": m.sql_template,
+        "type": m.metric_type,
+        "dimensions": [],
+        "time_column": m.time_column,
+        "tier": tier,
+        "tier_source": "metricflow",
+        "confidence": "high",
+        "notes": [],
+        "source": "metricflow",
+        "base_table": m.source_tables[0] if m.source_tables else None,
+    }
+
+
+_SQL_SUMMARY_PATTERN = re.compile(
+    r"SELECT\s+((?:COUNT|SUM|AVG|MIN|MAX)\s*\(\s*(?:DISTINCT\s+)?[^)]*\))",
+    re.IGNORECASE,
+)
+
+
+def _summarize_sql(sql: str) -> str:
+    """Extract aggregate summary like 'SUM(revenue_gbp)' or fall back to '(complex SQL)'."""
+    if not sql:
+        return "(no SQL)"
+    m = _SQL_SUMMARY_PATTERN.search(sql)
+    if m:
+        return m.group(1).upper().replace("  ", " ")
+    return "(complex SQL)"
+
+
+def _print_compile_summary(
+    metrics_list: list[dict],
+    *,
+    out_path: str,
+    cloud_synced: bool,
+    cloud_workspace_url: str | None,
+) -> None:
+    total = len(metrics_list)
+    opaque = sum(1 for m in metrics_list if m.get("tier") == "opaque")
+
+    # Cloud vs local summary line
+    if cloud_synced:
+        click.echo(f"\n[ok] IR compiled — {total} metrics synced to cloud")
+        click.echo("Reliability scores updating...")
+        if cloud_workspace_url:
+            click.echo(f"View at: {cloud_workspace_url}")
+        click.echo()
+    else:
+        suffix = f", {opaque} opaque" if opaque else ""
+        click.echo(f"\n[ok] IR compiled locally — {total} metrics{suffix}")
+        click.echo(f"Written to: {out_path}\n")
+
+    # Metric table: name / tier / sql summary
+    name_w = max((len(m.get("name", "")) for m in metrics_list), default=4) + 2
+    tier_w = 10
+    for m in metrics_list:
+        name = m.get("name", "")
+        tier = m.get("tier", "standard")
+        summary = _summarize_sql(m.get("sql", ""))
+        click.echo(f"  {name.ljust(name_w)}{tier.ljust(tier_w)}{summary}")
+
+    click.echo()
+    click.echo("Query interface ready:")
+    click.echo("  omx metrics list")
+    if metrics_list:
+        first = metrics_list[0]["name"]
+        click.echo(f"  omx query --metric {first}")
+    if cloud_synced:
+        click.echo("\nReliability scores -> app.onlymetrix.com")
+    else:
+        click.echo("\nFor reliability scores and team features:")
+        click.echo("  Sign up free at app.onlymetrix.com")
 
 
 # ── Reliability ──────────────────────────────────────────────────────

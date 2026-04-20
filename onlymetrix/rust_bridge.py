@@ -36,8 +36,11 @@ URL_TEMPLATE = (
     "https://github.com/{repo}/releases/download/{tag}/omx-{plat}.tar.gz"
 )
 
-# Subcommands the Rust binary owns. Everything else stays pure Python.
-RUST_SUBCOMMANDS = {"ci", "dbt", "discover", "scaffold"}
+# Subcommands the Rust binary owns and can be invoked directly by the user.
+# `dbt` is orchestrated from Python (free-tier local compile, optional cloud
+# sync) — Python shells into the Rust binary internally for the inference and
+# cloud-sync steps, but the user-facing surface lives in click.
+RUST_SUBCOMMANDS = {"ci", "discover", "scaffold"}
 
 
 IS_WINDOWS = platform.system().lower() == "windows"

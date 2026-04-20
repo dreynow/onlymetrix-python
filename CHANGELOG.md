@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.6.2
+
+### New features
+- `omx dbt sync --project-dir .` now works **without any OnlyMetrix
+  account**. Parses `target/manifest.json`, infers metrics from dbt
+  model SQL locally via the bundled Rust engine, and writes
+  `.omx/ir.json`. Zero server dependency, works offline.
+- Set `OMX_API_KEY` to additionally sync the compiled IR to the cloud
+  for reliability scoring, canvas dashboards, and team features — same
+  command, same compile, just an extra step when credentials are present.
+
+### Changed
+- `omx dbt sync` is now orchestrated by the Python CLI (click), not the
+  Rust binary. Rust handles the inference pass via a new internal
+  `omx dbt compile --manifest <path> --out <path>` subcommand that
+  Python shells into.
+- Free vs. paid signal: presence of `OMX_API_KEY`. No feature flags.
+- Output now shows a tier table (name / tier / SQL summary) instead of
+  a server-returned compile summary.
+
 ## v0.6.1
 
 ### New features
