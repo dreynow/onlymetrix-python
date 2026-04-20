@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.6.4
+
+### New features
+- Metric inference now walks the SQL AST of each dbt model and surfaces
+  every aliased aggregate call (SUM, AVG, COUNT, COUNT DISTINCT, MIN,
+  MAX) as a candidate metric. Previous inference depended on schema.yml
+  `data_type` declarations and naming conventions (`id`, `is_*`) that
+  most real dbt projects don't follow — jaffle_shop produced 0 metrics
+  on 0.6.3, produces 4 here. Benchmark_dbt goes from 6 to 16 metrics
+  with no regression.
+- Works with `dbt parse` alone — no warehouse connection required. The
+  compiler strips Jinja before parsing so pre-compile manifests still
+  give usable output. When `dbt compile` has been run and
+  `compiled_code` is present, it's preferred over `raw_code`.
+
 ## v0.6.3
 
 ### Changed
