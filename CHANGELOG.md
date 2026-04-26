@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.6.9 — 2026-04-26
+
+### Improved: `omx scaffold --fix` — disciplined refusal on ambiguous renames
+
+When the reliability check finds multiple plausible rename candidates,
+scaffold now prints the candidate list, names the design choice, and
+points to `--use-column`:
+
+```
+  Metric:  total_revenue
+  Drift:   column amount missing from public.orders
+
+  4 candidates found in current schema:
+    - credit_card_amount
+    - coupon_amount
+    - bank_transfer_amount
+    - gift_card_amount
+
+  Refusing to auto-pick. Multiple plausible matches.
+  This is by design: a wrong guess silently fabricates the wrong number.
+
+  Re-run with the column you intended:
+    omx scaffold --fix total_revenue --use-column <new_col>
+```
+
+Replaces the old generic `Error: missing old_column/new_column` message.
+
+### New tutorial: `tutorials/jaffle-shop-demo/` (in upstream monorepo)
+
+Self-contained jaffle_shop-based OnlyMetrix demo: postgres + dbt project +
+drift scripts. Pure-terminal, no Lightdash UI dependency.
+
 ## v0.6.8 — 2026-04-26
 
 ### New: `omx propose` — discover metrics from the warehouse schema

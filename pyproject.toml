@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onlymetrix"
-version = "0.6.8"
+version = "0.6.9"
 description = "Governed data access for AI agents. Connect to Snowflake, Postgres, or any warehouse with curated metrics, PII masking, and audit trails."
 readme = "README.md"
 license = {text = "MIT"}
