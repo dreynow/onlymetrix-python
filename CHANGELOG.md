@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.6.8 — 2026-04-26
+
+### New: `omx propose` — discover metrics from the warehouse schema
+
+`omx dbt sync` only sees what your dbt project exposes. `omx propose` reads
+the live warehouse `information_schema` and infers metrics from the actual
+tables and columns.
+
+```bash
+omx propose                        # writes proposed.yml in CWD
+omx propose --schemas public,sales # multi-schema scan
+omx propose --no-dedupe            # don't filter against .omx/ir.json
+```
+
+Reuses the same heuristic engine the cloud auto-suggest uses (pattern
+templates first — retail, subscription, etc. — then generic rules). Output
+is `proposed.yml`: top-level `metrics:` array each marked
+`confidence: high|medium|low`. Review, edit, then either copy entries into
+your canonical metrics.yml or `omx metrics import proposed.yml` (cloud).
+
+By default dedupes against `.omx/ir.json` so `omx dbt sync && omx propose`
+gives you "what dbt didn't see."
+
+On the demo Postgres (4 tables, 44 columns): dbt sync finds 7 metrics,
+propose finds 15 more — `avg_order_value`, `customer_count`,
+`revenue_by_country`, etc. Total surface 7 → 22.
+
 ## v0.6.7 — 2026-04-26
 
 ### Fix
