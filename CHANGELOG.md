@@ -1,6 +1,17 @@
 # Changelog
 
-## v0.6.6 — 2026-04-26
+## v0.6.7 — 2026-04-26
+
+### Fix
+
+- `__version__` in `onlymetrix/__init__.py` was stuck at `0.5.0` (since v0.5.0)
+  and not bumped in step with `pyproject.toml`. `rust_bridge.py` uses
+  `__version__` to pick which `omx` binary to download, so the stale value
+  caused `pip install onlymetrix==0.6.6` to download the v0.6.5 binary
+  (which doesn't know about `omx mcp serve`). v0.6.6 is yanked; install
+  v0.6.7 instead.
+
+## v0.6.6 — 2026-04-26 (yanked)
 
 ### New: local MCP server + runtime reliability gating
 
