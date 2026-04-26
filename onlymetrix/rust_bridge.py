@@ -40,7 +40,7 @@ URL_TEMPLATE = (
 # `dbt` is orchestrated from Python (free-tier local compile, optional cloud
 # sync) — Python shells into the Rust binary internally for the inference and
 # cloud-sync steps, but the user-facing surface lives in click.
-RUST_SUBCOMMANDS = {"ci", "discover", "scaffold"}
+RUST_SUBCOMMANDS = {"ci", "discover", "scaffold", "mcp"}
 
 
 IS_WINDOWS = platform.system().lower() == "windows"

@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.6.6 — 2026-04-26
+
+### New: local MCP server + runtime reliability gating
+
+- **`omx mcp serve`** — inline stdio MCP server. Loads metrics from
+  `.omx/ir.json`, connects to the warehouse via `OMX_WAREHOUSE_URL`/`DATABASE_URL`,
+  serves the same tool surface as `dataquery-mcp` from the single `omx` binary
+  (no separate install).
+- **`omx mcp config`** — print the Claude Code MCP config snippet.
+- **Runtime drift detection** — every `query_metric` call does a pre-flight
+  reliability check against the live `information_schema`. Refuses (does not
+  fabricate) below 50% reliability score. Detects column rename, table missing,
+  table empty.
+- **Three new MCP tools**: `check_reliability`, `trace_dependencies`,
+  `affected_by` (table → metric blast-radius).
+- **Refusal payload** structured with `reliability_score`, typed `issues`,
+  `affected_metrics` cascade, `suggested_actions`. Writes a synthetic
+  `omx-ci-output.json` so `omx scaffold --fix` can act on the detected rename
+  immediately.
+- **`omx scaffold --fix`** now also edits `.omx/ir.json` directly when a metric
+  has no top-level `metrics:` YAML to rewrite (the dbt-sync flow's common case).
+- `mcp` added to `RUST_SUBCOMMANDS` so `omx mcp serve|config` route directly to
+  the Rust binary.
+
+### Demo
+
+- `scripts/demo/` (in the upstream monorepo): setup.sh, seed.sql (200
+  customers, 50 products, 5000 invoices), simulate_drift.py (rename
+  total_amount → amount; truncate products), restore.py, RUNBOOK.md.
+  Reproducible end-to-end against an isolated Postgres container — no cloud,
+  no API key.
+
+### Tests
+
+- 17 new `reliability::local` unit tests (drift classification, fuzzy match,
+  cascade, synthetic CI output).
+- 4 new `tools` tests covering the three new tool definitions.
+- 5 new `local_mcp` tests (IR load, DSN resolution, config snippet).
+- Full `cargo test --lib` green: 847 passed.
+
 ## v0.6.5
 
 ### New features
